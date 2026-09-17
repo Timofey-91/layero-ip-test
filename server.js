@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 // ============================================================
 
 const TRACE_URL =
-  "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/tvc_trace.json";
+  "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
 
 const TRACE_CACHE_TIME = 60 * 1000;
 
