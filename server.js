@@ -4,53 +4,24 @@ import { URL } from "node:url";
 const PORT = process.env.PORT || 3000;
 
 // ======================================================
-// GITVERSE TRACE CONFIG
+// PEERSTV CONFIG
 // ======================================================
+const USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 8.0.1 tints)";
+const REFERER = "https://peers.tv";
 
-const TRACE_URL =
-  "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
+const PRIMARY_CONFIG_URL =
+  "https://raw.githubusercontent.com/Timofey-91/iptv-proxy/refs/heads/main/config.json";
 
-const TRACE_CACHE_TIME = 60 * 1000;
+const BACKUP_CONFIG_URL =
+  "https://raw.githubusercontent.com/Timofey-91/iptv-proxy-2/refs/heads/main/config.json";
 
-let traceCache = null;
-let traceExpiresAt = 0;
-
-
-// ======================================================
-// LIMEHD HEADERS
-// ======================================================
-
-const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-  "AppleWebKit/537.36 (KHTML, like Gecko) " +
-  "Chrome/153.0.0.0 Safari/537.36";
-
-const DEVICE_ID =
-  "576590.7544992064-1789471762048";
-
-const LHD_AGENT = JSON.stringify({
-  platform: "web",
-  app: "limehd.tv",
-  device_id: DEVICE_ID,
-});
-
-function limeHeaders() {
-  return {
-    "User-Agent": USER_AGENT,
-    "Accept": "*/*",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Origin": "https://limehd.tv",
-    "Referer": "https://limehd.tv/",
-    "X-Device-ID": DEVICE_ID,
-    "X-LHD-Agent": LHD_AGENT,
-  };
-}
-
+// Переменные для кэширования успешного источника в памяти
+let lastWorkingSource = null; // "primary" или "backup"
+let sourceCacheExpiresAt = 0; // Время жизни кэша источника
 
 // ======================================================
-// CORS
+// CORS & HEADERS
 // ======================================================
-
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -58,11 +29,6 @@ function corsHeaders() {
     "Access-Control-Allow-Headers": "*",
   };
 }
-
-
-// ======================================================
-// RESPONSE ERROR HELPER
-// ======================================================
 
 function sendError(response, status, message) {
   response.writeHead(status, {
@@ -72,137 +38,24 @@ function sendError(response, status, message) {
   response.end(message);
 }
 
-
 // ======================================================
-// LOAD TRACE CONFIG
+// REWRITE M3U8 TO ABSOLUTE URLS
 // ======================================================
-
-async function loadTrace() {
-  const now = Date.now();
-
-  if (traceCache && now < traceExpiresAt) {
-    return traceCache;
-  }
-
-  const response = await fetch(TRACE_URL, {
-    method: "GET",
-    cache: "no-store",
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept": "application/json",
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`GitVerse trace HTTP ${response.status}`);
-  }
-
-  const trace = await response.json();
-
-  if (!trace || typeof trace !== "object") {
-    throw new Error("Invalid tvc_trace.json");
-  }
-
-  traceCache = trace;
-  traceExpiresAt = now + TRACE_CACHE_TIME;
-
-  return trace;
-}
-
-
-// ============================================================
-// FIND CHANNEL
-// ============================================================
-
-function findChannel(value, name) {
-  if (!value || typeof value !== "object") {
-    return null;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findChannel(item, name);
-      if (found) return found;
-    }
-    return null;
-  }
-
-  for (const [key, item] of Object.entries(value)) {
-    if (key.toLowerCase() === name.toLowerCase()) {
-      return item;
-    }
-
-    const found = findChannel(item, name);
-    if (found) return found;
-  }
-
-  return null;
-}
-
-
-// ============================================================
-// FIND M3U8
-// ============================================================
-
-function findM3u8(value, result = []) {
-  if (typeof value === "string") {
-    if (/\.m3u8(?:\?|$)/i.test(value) && !result.includes(value)) {
-      result.push(value);
-    }
-    return result;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) findM3u8(item, result);
-    return result;
-  }
-
-  if (value && typeof value === "object") {
-    for (const item of Object.values(value)) findM3u8(item, result);
-  }
-
-  return result;
-}
-
-
-// ============================================================
-// GET CURRENT MASTER URL
-// ============================================================
-
-async function getChannelUrl(channelName) {
-  const trace = await loadTrace();
-
-  const channelData = findChannel(trace, channelName);
-
-  if (!channelData) {
-    throw new Error(`Channel not found: ${channelName}`);
-  }
-
-  const urls = findM3u8(channelData);
-
-  if (!urls.length) {
-    throw new Error(`No M3U8 found for ${channelName}`);
-  }
-
-  return urls[0];
-}
-
-
-// ======================================================
-// REWRITE M3U8
-// ======================================================
-
 function rewritePlaylist(text, targetUrl) {
   let baseUrl;
-
   try {
     baseUrl = new URL(targetUrl);
   } catch {
     return text;
   }
 
-  const lines = text.split(/\r?\n/);
+  // 1. Применяем ваши регулярки для PeersTV
+  let processedText = text.replace(/^#BYTEFOG-INF.*\n?/gm, "");
+  processedText = processedText.replace(/\/tvc_plus\d+\//g, "");
 
+  // 2. Делаем пути абсолютными (чтобы клиент качал видео сам)
+  const lines = processedText.split(/\r?\n/);
+  
   return lines.map(line => {
     const trimmed = line.trim();
 
@@ -210,9 +63,7 @@ function rewritePlaylist(text, targetUrl) {
       return line;
     }
 
-    // ----------------------------------------------
-    // URI="..."
-    // ----------------------------------------------
+    // Если это служебный тег с URI="..." (например #EXT-X-KEY)
     if (trimmed.startsWith("#") && trimmed.includes('URI="')) {
       return line.replace(/URI="([^"]+)"/g, (match, uri) => {
         try {
@@ -224,9 +75,7 @@ function rewritePlaylist(text, targetUrl) {
       });
     }
 
-    // ----------------------------------------------
-    // обычные URL / relative URL
-    // ----------------------------------------------
+    // Если это путь к сегменту (.ts) или вложенному плейлисту
     if (!trimmed.startsWith("#")) {
       try {
         return new URL(trimmed, baseUrl).toString();
@@ -239,69 +88,29 @@ function rewritePlaylist(text, targetUrl) {
   }).join("\n");
 }
 
-
 // ======================================================
-// PLAYLIST FETCH
+// FETCH HELPERS
 // ======================================================
-
-async function fetchPlaylist(targetUrl, serverResponse) {
-  let response;
-
-  try {
-    response = await fetch(targetUrl, {
-      method: "GET",
-      redirect: "follow",
-      cache: "no-store",
-      headers: limeHeaders(),
-    });
-  } catch (error) {
-    return sendError(
-      serverResponse,
-      502,
-      "Playlist fetch error: " + (error instanceof Error ? error.message : String(error))
-    );
-  }
-
-  // ====================================================
-  // UPSTREAM ERROR
-  // ====================================================
-  if (!response.ok) {
-    let body = "";
-    try {
-      body = await response.text();
-    } catch {}
-
-    return sendError(
-      serverResponse,
-      502,
-      "LimeHD error: " + response.status + "\n\n" + body.substring(0, 1000)
-    );
-  }
-
-  // ====================================================
-  // READ AND REWRITE M3U8
-  // ====================================================
-  const text = await response.text();
-  const rewritten = rewritePlaylist(text, targetUrl);
-
-  // ====================================================
-  // RETURN M3U8
-  // ====================================================
-  serverResponse.writeHead(200, {
-    ...corsHeaders(),
-    "Content-Type": "application/vnd.apple.mpegurl",
-    "Cache-Control": "no-store, no-cache, must-revalidate",
-    "Pragma": "no-cache",
-  });
-  
-  serverResponse.end(rewritten);
+async function fetchConfig(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Config fetch failed: ${r.status}`);
+  return await r.json();
 }
 
+async function fetchStream(url) {
+  const r = await fetch(url, {
+    headers: {
+      "User-Agent": USER_AGENT,
+      "Referer": REFERER,
+    },
+  });
+  if (!r.ok) throw new Error(`Stream fetch failed: ${r.status}`);
+  return r;
+}
 
 // ======================================================
 // SERVER
 // ======================================================
-
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(
@@ -309,74 +118,101 @@ const server = http.createServer(async (request, response) => {
       `http://${request.headers.host || "localhost"}`
     );
 
-    // ==================================================
-    // OPTIONS
-    // ==================================================
+    // OPTIONS (CORS)
     if (request.method === "OPTIONS") {
       response.writeHead(204, corsHeaders());
       response.end();
       return;
     }
 
-
-    // ==================================================
-    // GET / HEAD ONLY
-    // ==================================================
+    // Допускаем только GET и HEAD
     if (request.method !== "GET" && request.method !== "HEAD") {
       return sendError(response, 405, "Method Not Allowed");
     }
 
+    // Получаем имя канала из пути (убираем слэши и .m3u8)
+    const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
-    // ==================================================
-    // CHANNEL
-    // ==================================================
-    const channel = url.pathname
-      .replace(/^\/+/, "")
-      .replace(/\.m3u8$/i, "");
-
-
-    // ==================================================
-    // ROOT
-    // ==================================================
-    if (!channel) {
-      const body = "Layero LimeHD Proxy is working.\n\n" +
-                   "Examples:\n" +
-                   "/tvc_plus2\n" +
-                   "/other_channel\n";
-                   
+    if (!path) {
       response.writeHead(200, {
         ...corsHeaders(),
         "Content-Type": "text/plain; charset=utf-8",
       });
-      response.end(body);
+      response.end("PeersTV Proxy is working.\n\nExamples:\n/1tv\n/russia1");
       return;
     }
 
+    let config = null;
+    let targetUrl = null;
+    let resp = null;
 
-    // ==================================================
-    // GET TARGET URL FROM TRACE
-    // ==================================================
-    let targetUrl;
+    const isCacheValid = lastWorkingSource && Date.now() < sourceCacheExpiresAt;
 
-    try {
-      targetUrl = await getChannelUrl(channel);
-    } catch (error) {
-      const status = error.message.includes("not found") ? 404 : 502;
-      return sendError(
-        response, 
-        status, 
-        "Channel error: " + (error instanceof Error ? error.message : String(error))
-      );
+    // ============================================================
+    // ВАРИАНТ А: Если кэш помнит, что работал резервный источник
+    // ============================================================
+    if (isCacheValid && lastWorkingSource === "backup") {
+      try {
+        config = await fetchConfig(BACKUP_CONFIG_URL);
+        if (path in config) {
+          targetUrl = config[path];
+          resp = await fetchStream(targetUrl);
+        }
+      } catch (backupErr) {
+        console.log("Кэшированный резерв подвел, сбрасываем кэш...");
+        lastWorkingSource = null;
+        resp = null;
+      }
     }
 
-    if (typeof targetUrl !== "string" || !targetUrl) {
-      return sendError(response, 502, "Invalid channel URL");
+    // ============================================================
+    // ВАРИАНТ Б: Обычная логика — сначала Primary
+    // ============================================================
+    if (!resp) {
+      try {
+        config = await fetchConfig(PRIMARY_CONFIG_URL);
+        if (path in config) {
+          targetUrl = config[path];
+          resp = await fetchStream(targetUrl);
+          
+          lastWorkingSource = "primary";
+          sourceCacheExpiresAt = Date.now() + 5 * 60 * 1000;
+        }
+      } catch (e) {
+        console.log("Основной конфиг подвел. Причина:", e.message);
+        resp = null;
+      }
     }
 
+    // ============================================================
+    // ВАРИАНТ В: Экстренный переход на Backup
+    // ============================================================
+    if (!resp && (!isCacheValid || lastWorkingSource !== "backup")) {
+      try {
+        config = await fetchConfig(BACKUP_CONFIG_URL);
+        
+        if (!config || !(path in config)) {
+          return sendError(response, 404, "Channel not found in backup config");
+        }
 
-    // ==================================================
-    // HEAD
-    // ==================================================
+        targetUrl = config[path];
+        resp = await fetchStream(targetUrl);
+        
+        lastWorkingSource = "backup";
+        sourceCacheExpiresAt = Date.now() + 5 * 60 * 1000;
+      } catch (backupError) {
+        return sendError(response, 502, `All sources failed. Error: ${backupError.message}`);
+      }
+    }
+
+    // ============================================================
+    // ОБРАБОТКА ПЛЕЙЛИСТА
+    // ============================================================
+    if (!resp || !resp.ok) {
+      return sendError(response, 502, "PeersTV Stream Error from all sources");
+    }
+
+    // HEAD запрос возвращаем без скачивания тела
     if (request.method === "HEAD") {
       response.writeHead(200, {
         ...corsHeaders(),
@@ -386,26 +222,26 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    const body = await resp.text();
+    const rewrittenBody = rewritePlaylist(body, targetUrl);
 
-    // ==================================================
-    // FETCH PLAYLIST
-    // ==================================================
-    await fetchPlaylist(targetUrl, response);
+    response.writeHead(200, {
+      ...corsHeaders(),
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+    });
+    
+    response.end(rewrittenBody);
 
   } catch (error) {
     sendError(
-      response, 
-      500, 
+      response,
+      500,
       "Proxy error: " + (error instanceof Error ? error.message : String(error))
     );
   }
 });
 
-
-// ============================================================
-// LISTEN
-// ============================================================
-
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Layero LimeHD Proxy listening on ${PORT}`);
+  console.log(`Layero PeersTV Proxy listening on ${PORT}`);
 });
