@@ -14,19 +14,25 @@ function corsHeaders() {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "*",
+    // Запрещаем плееру кэшировать 302-ответ
+    "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
   };
 }
 
-// Вспомогательная функция: качает конфиг и возвращает данные + время последнего коммита
-async function fetchConfigWithTime(url) {
-  const r = await fetch(url);
+// Качаем конфиг с обходом кэша GitHub и читаем updated_at из JSON
+async function fetchConfig(baseUrl) {
+  const cacheBusterUrl = `${baseUrl}?t=${Date.now()}`;
+  const r = await fetch(cacheBusterUrl, {
+    headers: { "Cache-Control": "no-cache, no-store" },
+  });
+
   if (!r.ok) throw new Error(`Fetch failed: ${r.status}`);
 
-  // GitHub автоматически отдает время последнего коммита в заголовке last-modified
-  const lastModifiedHeader = r.headers.get("last-modified");
-  const updatedTime = lastModifiedHeader ? new Date(lastModifiedHeader).getTime() : 0;
-
   const data = await r.json();
+  const updatedTime = Number(data.updated_at) || 0;
+
   return { data, updatedTime };
 }
 
@@ -50,14 +56,14 @@ const server = http.createServer(async (request, response) => {
         ...corsHeaders(),
         "Content-Type": "text/plain; charset=utf-8",
       });
-      response.end("Smart Time-based Redirector is working.");
+      response.end("Smart Time-based Redirector (Node.js JSON-timestamp) Active.");
       return;
     }
 
     // Загружаем оба конфига параллельно
     const [primaryResult, backupResult] = await Promise.allSettled([
-      fetchConfigWithTime(PRIMARY_CONFIG_URL),
-      fetchConfigWithTime(BACKUP_CONFIG_URL),
+      fetchConfig(PRIMARY_CONFIG_URL),
+      fetchConfig(BACKUP_CONFIG_URL),
     ]);
 
     const primary = primaryResult.status === "fulfilled" ? primaryResult.value : null;
@@ -65,9 +71,12 @@ const server = http.createServer(async (request, response) => {
 
     let targetUrl = null;
 
-    // Сравниваем время обновления: выбираем то, что свежее
+    const primaryTime = primary ? primary.updatedTime : 0;
+    const backupTime = backup ? backup.updatedTime : 0;
+
+    // Сравниваем метки времени из самих файлов JSON
     if (primary && backup) {
-      if (primary.updatedTime >= backup.updatedTime) {
+      if (primaryTime >= backupTime) {
         // Конфиг 1 свежее
         targetUrl = primary.data[path] || backup.data[path];
       } else {
@@ -106,5 +115,5 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Redirector listening on ${PORT}`);
+  console.log(`Node.js Redirector listening on ${PORT}`);
 });
