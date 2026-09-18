@@ -17,18 +17,17 @@ function corsHeaders() {
   };
 }
 
-function sendError(response, status, message) {
-  response.writeHead(status, {
-    ...corsHeaders(),
-    "Content-Type": "text/plain; charset=utf-8",
-  });
-  response.end(message);
-}
-
-async function fetchConfig(url) {
+// Вспомогательная функция: качает конфиг и возвращает данные + время последнего коммита
+async function fetchConfigWithTime(url) {
   const r = await fetch(url);
-  if (!r.ok) throw new Error(`Config fetch failed: ${r.status}`);
-  return await r.json();
+  if (!r.ok) throw new Error(`Fetch failed: ${r.status}`);
+
+  // GitHub автоматически отдает время последнего коммита в заголовке last-modified
+  const lastModifiedHeader = r.headers.get("last-modified");
+  const updatedTime = lastModifiedHeader ? new Date(lastModifiedHeader).getTime() : 0;
+
+  const data = await r.json();
+  return { data, updatedTime };
 }
 
 const server = http.createServer(async (request, response) => {
@@ -38,7 +37,6 @@ const server = http.createServer(async (request, response) => {
       `http://${request.headers.host || "localhost"}`
     );
 
-    // OPTIONS (CORS)
     if (request.method === "OPTIONS") {
       response.writeHead(204, corsHeaders());
       response.end();
@@ -52,39 +50,46 @@ const server = http.createServer(async (request, response) => {
         ...corsHeaders(),
         "Content-Type": "text/plain; charset=utf-8",
       });
-      response.end("PeersTV Redirector is working.");
+      response.end("Smart Time-based Redirector is working.");
       return;
     }
 
+    // Загружаем оба конфига параллельно
+    const [primaryResult, backupResult] = await Promise.allSettled([
+      fetchConfigWithTime(PRIMARY_CONFIG_URL),
+      fetchConfigWithTime(BACKUP_CONFIG_URL),
+    ]);
+
+    const primary = primaryResult.status === "fulfilled" ? primaryResult.value : null;
+    const backup = backupResult.status === "fulfilled" ? backupResult.value : null;
+
     let targetUrl = null;
 
-    // 1. Пробуем получить ссылку из основного конфига с GitHub
-    try {
-      const config = await fetchConfig(PRIMARY_CONFIG_URL);
-      if (path in config) {
-        targetUrl = config[path];
+    // Сравниваем время обновления: выбираем то, что свежее
+    if (primary && backup) {
+      if (primary.updatedTime >= backup.updatedTime) {
+        // Конфиг 1 свежее
+        targetUrl = primary.data[path] || backup.data[path];
+      } else {
+        // Конфиг 2 свежее
+        targetUrl = backup.data[path] || primary.data[path];
       }
-    } catch (e) {
-      console.log("Основной конфиг не ответил, используем резервный...");
-    }
-
-    // 2. Если в основном нет канала или GitHub сбойнул — берем резервный
-    if (!targetUrl) {
-      try {
-        const backupConfig = await fetchConfig(BACKUP_CONFIG_URL);
-        if (backupConfig && path in backupConfig) {
-          targetUrl = backupConfig[path];
-        }
-      } catch (backupErr) {
-        console.log("Резервный конфиг недоступен");
-      }
+    } else if (primary) {
+      targetUrl = primary.data[path];
+    } else if (backup) {
+      targetUrl = backup.data[path];
     }
 
     if (!targetUrl) {
-      return sendError(response, 404, "Channel not found in configs");
+      response.writeHead(404, {
+        ...corsHeaders(),
+        "Content-Type": "text/plain; charset=utf-8",
+      });
+      response.end("Channel not found in configs");
+      return;
     }
 
-    // 3. Отправляем 302 Перенаправление на ваш домашний плеер
+    // Отправляем 302 Редирект на свежайшую ссылку
     response.writeHead(302, {
       ...corsHeaders(),
       "Location": targetUrl,
@@ -92,10 +97,14 @@ const server = http.createServer(async (request, response) => {
     response.end();
 
   } catch (error) {
-    sendError(response, 500, "Redirector error: " + error.message);
+    response.writeHead(500, {
+      ...corsHeaders(),
+      "Content-Type": "text/plain; charset=utf-8",
+    });
+    response.end("Redirector error: " + error.message);
   }
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Layero Redirector listening on ${PORT}`);
+  console.log(`Redirector listening on ${PORT}`);
 });
