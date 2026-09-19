@@ -15,9 +15,8 @@ const LHD_AGENT = JSON.stringify({
   generation: "2",
 });
 
-// Кэш в оперативной памяти
 let configCache = { data: null, expiresAt: 0 };
-const m3u8Cache = new Map(); // path -> { content: string, expiresAt: number }
+const m3u8Cache = new Map();
 
 function corsHeaders() {
   return {
@@ -30,10 +29,9 @@ function corsHeaders() {
   };
 }
 
-// Загрузка config.json с кэшированием на 60 секунд
-async function fetchConfig() {
+async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
-  if (configCache.data && now < configCache.expiresAt) {
+  if (!forceRefresh && configCache.data && now < configCache.expiresAt) {
     return configCache.data;
   }
 
@@ -50,13 +48,12 @@ async function fetchConfig() {
 
   configCache = {
     data,
-    expiresAt: now + 60 * 1000, // Кэш на 60 сек
+    expiresAt: now + 30 * 1000, // Кэш конфига 30 секунд
   };
 
   return data;
 }
 
-// Преобразование путей внутри M3U8 на прокси-сегменты
 function resolveM3u8Urls(m3u8Text, baseUrlStr) {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
@@ -100,16 +97,13 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 1. Проксирование видеосегментов .ts
+    // 1. Проксирование сегментов
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
 
       if (!targetUrl) {
-        response.writeHead(400, {
-          ...corsHeaders(),
-          "Content-Type": "text/plain; charset=utf-8",
-        });
-        response.end("Missing url parameter");
+        response.writeHead(400, corsHeaders());
+        response.end();
         return;
       }
 
@@ -125,11 +119,13 @@ const server = http.createServer(async (request, response) => {
       });
 
       if (!segmentRes.ok) {
-        response.writeHead(segmentRes.status, {
-          ...corsHeaders(),
-          "Content-Type": "text/plain; charset=utf-8",
-        });
-        response.end(`Segment fetch failed: ${segmentRes.status}`);
+        // При ошибке сегмента сбрасываем кэш плейлистов, чтобы плеер перезапросил свежий M3U8
+        m3u8Cache.clear();
+        configCache.data = null;
+
+        // Отдаем чистый код 503 без текста, чтобы плеер не путал его с видеофайлом
+        response.writeHead(503, corsHeaders());
+        response.end();
         return;
       }
 
@@ -146,7 +142,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Обработка запросов M3U8 плейлиста
+    // 2. Запрос M3U8 плейлиста
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
     if (!path) {
@@ -154,13 +150,12 @@ const server = http.createServer(async (request, response) => {
         ...corsHeaders(),
         "Content-Type": "text/plain; charset=utf-8",
       });
-      response.end("Lime TV M3U8 Proxy with Cache is running.");
+      response.end("Lime TV Proxy is running.");
       return;
     }
 
     const now = Date.now();
 
-    // Проверка короткого кэша плейлиста (3 секунды)
     if (m3u8Cache.has(path)) {
       const cached = m3u8Cache.get(path);
       if (now < cached.expiresAt) {
@@ -177,11 +172,8 @@ const server = http.createServer(async (request, response) => {
     const limeStreamUrl = config[path];
 
     if (!limeStreamUrl) {
-      response.writeHead(404, {
-        ...corsHeaders(),
-        "Content-Type": "text/plain; charset=utf-8",
-      });
-      response.end("Channel not found in Lime config");
+      response.writeHead(404, corsHeaders());
+      response.end("Channel not found");
       return;
     }
 
@@ -198,21 +190,17 @@ const server = http.createServer(async (request, response) => {
     });
 
     if (!limeResponse.ok) {
-      response.writeHead(limeResponse.status, {
-        ...corsHeaders(),
-        "Content-Type": "text/plain; charset=utf-8",
-      });
-      response.end(`Lime TV upstream error: ${limeResponse.status}`);
+      response.writeHead(limeResponse.status, corsHeaders());
+      response.end();
       return;
     }
 
     const rawM3u8 = await limeResponse.text();
     const processedM3u8 = resolveM3u8Urls(rawM3u8, limeStreamUrl);
 
-    // Сохраняем обработанный M3U8 в кэш на 3 секунды
     m3u8Cache.set(path, {
       content: processedM3u8,
-      expiresAt: now + 3000,
+      expiresAt: now + 2000, // Кэш плейлиста всего 2 секунды
     });
 
     response.writeHead(200, {
@@ -221,14 +209,11 @@ const server = http.createServer(async (request, response) => {
     });
     response.end(processedM3u8);
   } catch (error) {
-    response.writeHead(500, {
-      ...corsHeaders(),
-      "Content-Type": "text/plain; charset=utf-8",
-    });
-    response.end("Proxy error: " + error.message);
+    response.writeHead(500, corsHeaders());
+    response.end();
   }
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Lime TV Proxy with caching listening on port ${PORT}`);
+  console.log(`Lime TV Proxy listening on port ${PORT}`);
 });
