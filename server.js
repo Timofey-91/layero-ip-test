@@ -7,6 +7,16 @@ const PORT = process.env.PORT || 3000;
 const CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
 
+// Специальный заголовок LimeHD приложения из Python-скрипта
+const LHD_AGENT = JSON.stringify({
+  version_name: "1.0.2.203",
+  version_code: "203",
+  platform: "win",
+  device_id: "00000000",
+  app: "tv.limehd.win",
+  generation: "2",
+});
+
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -23,8 +33,8 @@ async function fetchConfig() {
   const r = await fetch(CONFIG_URL, {
     headers: {
       "Cache-Control": "no-cache, no-store",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "User-Agent": "Mozilla/5.0",
+      "X-LHD-Agent": LHD_AGENT,
     },
   });
 
@@ -101,11 +111,11 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Запрашиваем .m3u8 с Lime TV с полной эмуляцией браузера (защита от 423)
+    // 2. Запрашиваем .m3u8 с Lime TV с эмуляцией заголовков приложения и браузера
     const limeResponse = await fetch(limeStreamUrl, {
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0",
+        "X-LHD-Agent": LHD_AGENT,
         "Referer": "https://limehd.tv/",
         "Origin": "https://limehd.tv",
         "Accept": "*/*",
