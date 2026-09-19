@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 3000;
 
 // Прямой URL на сырой конфиг GitVerse
 const CONFIG_URL =
-  "https://gitverse.ru/Timofey-91/peer_test/raw/branch/master/config.json";
+  "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
 
 function corsHeaders() {
   return {
