@@ -3,11 +3,9 @@ import { URL } from "node:url";
 
 const PORT = process.env.PORT || 3000;
 
-// Точный URL к конфигу на GitVerse
 const CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
 
-// Специальный заголовок LimeHD приложения
 const LHD_AGENT = JSON.stringify({
   version_name: "1.0.2.203",
   version_code: "203",
@@ -16,6 +14,10 @@ const LHD_AGENT = JSON.stringify({
   app: "tv.limehd.win",
   generation: "2",
 });
+
+// Кэш в оперативной памяти
+let configCache = { data: null, expiresAt: 0 };
+const m3u8Cache = new Map(); // path -> { content: string, expiresAt: number }
 
 function corsHeaders() {
   return {
@@ -28,8 +30,13 @@ function corsHeaders() {
   };
 }
 
-// Загружаем конфиг с GitVerse
+// Загрузка config.json с кэшированием на 60 секунд
 async function fetchConfig() {
+  const now = Date.now();
+  if (configCache.data && now < configCache.expiresAt) {
+    return configCache.data;
+  }
+
   const r = await fetch(CONFIG_URL, {
     headers: {
       "Cache-Control": "no-cache, no-store",
@@ -39,10 +46,17 @@ async function fetchConfig() {
   });
 
   if (!r.ok) throw new Error(`Config fetch failed: ${r.status}`);
-  return await r.json();
+  const data = await r.json();
+
+  configCache = {
+    data,
+    expiresAt: now + 60 * 1000, // Кэш на 60 сек
+  };
+
+  return data;
 }
 
-// Переписываем ссылки внутри .m3u8 так, чтобы они шли через наш прокси (/proxy-segment)
+// Преобразование путей внутри M3U8 на прокси-сегменты
 function resolveM3u8Urls(m3u8Text, baseUrlStr) {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
@@ -51,7 +65,6 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr) {
     const trimmed = line.trim();
     if (!trimmed) return line;
 
-    // Переписываем URI="..." внутри тегов (#EXT-X-KEY, #EXT-X-MEDIA и т.д.)
     if (trimmed.startsWith("#")) {
       return line.replace(/URI=["']([^"']+)["']/g, (match, relativeUri) => {
         try {
@@ -63,7 +76,6 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr) {
       });
     }
 
-    // Переписываем ссылки на сегменты (.ts) или суб-плейлисты
     try {
       const absoluteUri = new URL(trimmed, baseUrl).toString();
       return `/proxy-segment?url=${encodeURIComponent(absoluteUri)}`;
@@ -88,7 +100,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // Обработка запросов к .ts сегментам
+    // 1. Проксирование видеосегментов .ts
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
 
@@ -134,7 +146,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // Обработка запросов к плейлистам
+    // 2. Обработка запросов M3U8 плейлиста
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
     if (!path) {
@@ -142,11 +154,25 @@ const server = http.createServer(async (request, response) => {
         ...corsHeaders(),
         "Content-Type": "text/plain; charset=utf-8",
       });
-      response.end("Lime TV M3U8 Proxy is running.");
+      response.end("Lime TV M3U8 Proxy with Cache is running.");
       return;
     }
 
-    // 1. Получаем конфиг ссылок с GitVerse
+    const now = Date.now();
+
+    // Проверка короткого кэша плейлиста (3 секунды)
+    if (m3u8Cache.has(path)) {
+      const cached = m3u8Cache.get(path);
+      if (now < cached.expiresAt) {
+        response.writeHead(200, {
+          ...corsHeaders(),
+          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        });
+        response.end(cached.content);
+        return;
+      }
+    }
+
     const config = await fetchConfig();
     const limeStreamUrl = config[path];
 
@@ -159,7 +185,6 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Запрашиваем .m3u8 с Lime TV
     const limeResponse = await fetch(limeStreamUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0",
@@ -182,11 +207,14 @@ const server = http.createServer(async (request, response) => {
     }
 
     const rawM3u8 = await limeResponse.text();
-
-    // 3. Заменяем пути сегментов на ссылки через /proxy-segment
     const processedM3u8 = resolveM3u8Urls(rawM3u8, limeStreamUrl);
 
-    // 4. Отдаем готовый плейлист плееру
+    // Сохраняем обработанный M3U8 в кэш на 3 секунды
+    m3u8Cache.set(path, {
+      content: processedM3u8,
+      expiresAt: now + 3000,
+    });
+
     response.writeHead(200, {
       ...corsHeaders(),
       "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
@@ -202,5 +230,5 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Lime TV Proxy listening on port ${PORT}`);
+  console.log(`Lime TV Proxy with caching listening on port ${PORT}`);
 });
