@@ -7,7 +7,7 @@ const PORT = process.env.PORT || 3000;
 const CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
 
-// Специальный заголовок LimeHD приложения из Python-скрипта
+// Специальный заголовок LimeHD приложения
 const LHD_AGENT = JSON.stringify({
   version_name: "1.0.2.203",
   version_code: "203",
@@ -42,7 +42,7 @@ async function fetchConfig() {
   return await r.json();
 }
 
-// Преобразуем относительные ссылки и URI внутри .m3u8 в абсолютные
+// Переписываем ссылки внутри .m3u8 так, чтобы они шли через наш прокси (/proxy-segment)
 function resolveM3u8Urls(m3u8Text, baseUrlStr) {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
@@ -56,16 +56,17 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr) {
       return line.replace(/URI=["']([^"']+)["']/g, (match, relativeUri) => {
         try {
           const absoluteUri = new URL(relativeUri, baseUrl).toString();
-          return `URI="${absoluteUri}"`;
+          return `URI="/proxy-segment?url=${encodeURIComponent(absoluteUri)}"`;
         } catch {
           return match;
         }
       });
     }
 
-    // Переписываем обычные строки со ссылками на сегменты (.ts) или суб-плейлисты
+    // Переписываем ссылки на сегменты (.ts) или суб-плейлисты
     try {
-      return new URL(trimmed, baseUrl).toString();
+      const absoluteUri = new URL(trimmed, baseUrl).toString();
+      return `/proxy-segment?url=${encodeURIComponent(absoluteUri)}`;
     } catch {
       return line;
     }
@@ -87,6 +88,53 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    // Обработка запросов к .ts сегментам
+    if (url.pathname === "/proxy-segment") {
+      const targetUrl = url.searchParams.get("url");
+
+      if (!targetUrl) {
+        response.writeHead(400, {
+          ...corsHeaders(),
+          "Content-Type": "text/plain; charset=utf-8",
+        });
+        response.end("Missing url parameter");
+        return;
+      }
+
+      const segmentRes = await fetch(targetUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          "X-LHD-Agent": LHD_AGENT,
+          "Referer": "https://limehd.tv/",
+          "Origin": "https://limehd.tv",
+          "Accept": "*/*",
+          "Connection": "keep-alive",
+        },
+      });
+
+      if (!segmentRes.ok) {
+        response.writeHead(segmentRes.status, {
+          ...corsHeaders(),
+          "Content-Type": "text/plain; charset=utf-8",
+        });
+        response.end(`Segment fetch failed: ${segmentRes.status}`);
+        return;
+      }
+
+      const arrayBuffer = await segmentRes.arrayBuffer();
+
+      response.writeHead(200, {
+        ...corsHeaders(),
+        "Content-Type":
+          segmentRes.headers.get("content-type") || "video/mp2t",
+        "Content-Length": arrayBuffer.byteLength,
+      });
+
+      response.end(Buffer.from(arrayBuffer));
+      return;
+    }
+
+    // Обработка запросов к плейлистам
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
     if (!path) {
@@ -111,7 +159,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Запрашиваем .m3u8 с Lime TV с эмуляцией заголовков приложения и браузера
+    // 2. Запрашиваем .m3u8 с Lime TV
     const limeResponse = await fetch(limeStreamUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0",
@@ -135,7 +183,7 @@ const server = http.createServer(async (request, response) => {
 
     const rawM3u8 = await limeResponse.text();
 
-    // 3. Превращаем относительные ссылки внутри M3U8 в абсолютные
+    // 3. Заменяем пути сегментов на ссылки через /proxy-segment
     const processedM3u8 = resolveM3u8Urls(rawM3u8, limeStreamUrl);
 
     // 4. Отдаем готовый плейлист плееру
@@ -144,7 +192,6 @@ const server = http.createServer(async (request, response) => {
       "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
     });
     response.end(processedM3u8);
-
   } catch (error) {
     response.writeHead(500, {
       ...corsHeaders(),
