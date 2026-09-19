@@ -3,7 +3,7 @@ import { URL } from "node:url";
 
 const PORT = process.env.PORT || 3000;
 
-// Прямой URL на сырой конфиг GitVerse
+// Точный URL к конфигу на GitVerse
 const CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
 
@@ -18,13 +18,13 @@ function corsHeaders() {
   };
 }
 
-// Загружаем конфиг с GitVerse без вызова 400 Bad Request
+// Загружаем конфиг с GitVerse
 async function fetchConfig() {
   const r = await fetch(CONFIG_URL, {
     headers: {
       "Cache-Control": "no-cache, no-store",
       "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     },
   });
 
@@ -101,11 +101,16 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Запрашиваем .m3u8 с Lime TV с российского IP сервера Layero
+    // 2. Запрашиваем .m3u8 с Lime TV с полной эмуляцией браузера (защита от 423)
     const limeResponse = await fetch(limeStreamUrl, {
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://limehd.tv/",
+        "Origin": "https://limehd.tv",
+        "Accept": "*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive",
       },
     });
 
