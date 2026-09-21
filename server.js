@@ -3,11 +3,8 @@ import { URL } from "node:url";
 
 const PORT = process.env.PORT || 3000;
 
-// Источники конфигов
-const LIME_CONFIG_URL =
+const CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
-const WINK_CONFIG_URL =
-  "https://gitverse.ru/api/repos/Timofey91/mediavitrina-proxy/raw/branch/master/wink.json";
 
 const LHD_AGENT = JSON.stringify({
   version_name: "1.0.2.203",
@@ -32,55 +29,29 @@ function corsHeaders() {
   };
 }
 
-async function fetchConfigs(forceRefresh = false) {
+async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
   if (!forceRefresh && configCache.data && now < configCache.expiresAt) {
     return configCache.data;
   }
 
-  // Загружаем оба конфига параллельно
-  const [limeRes, winkRes] = await Promise.allSettled([
-    fetch(LIME_CONFIG_URL, {
-      headers: {
-        "Cache-Control": "no-cache, no-store",
-        "User-Agent": "Mozilla/5.0",
-        "X-LHD-Agent": LHD_AGENT,
-      },
-    }),
-    fetch(WINK_CONFIG_URL, {
-      headers: {
-        "Cache-Control": "no-cache, no-store",
-        "User-Agent": "Mozilla/5.0",
-      },
-    }),
-  ]);
+  const r = await fetch(CONFIG_URL, {
+    headers: {
+      "Cache-Control": "no-cache, no-store",
+      "User-Agent": "Mozilla/5.0",
+      "X-LHD-Agent": LHD_AGENT,
+    },
+  });
 
-  let combinedConfig = {};
-
-  if (limeRes.status === "fulfilled" && limeRes.value.ok) {
-    try {
-      const limeData = await limeRes.value.json();
-      combinedConfig = { ...combinedConfig, ...limeData };
-    } catch (e) {
-      console.error("Error parsing Lime config:", e);
-    }
-  }
-
-  if (winkRes.status === "fulfilled" && winkRes.value.ok) {
-    try {
-      const winkData = await winkRes.value.json();
-      combinedConfig = { ...combinedConfig, ...winkData };
-    } catch (e) {
-      console.error("Error parsing Wink config:", e);
-    }
-  }
+  if (!r.ok) throw new Error(`Config fetch failed: ${r.status}`);
+  const data = await r.json();
 
   configCache = {
-    data: combinedConfig,
-    expiresAt: now + 30 * 1000, // Кэш конфигов 30 секунд
+    data,
+    expiresAt: now + 30 * 1000, // Кэш конфига 30 секунд
   };
 
-  return combinedConfig;
+  return data;
 }
 
 function resolveM3u8Urls(m3u8Text, baseUrlStr) {
@@ -136,29 +107,23 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      // Если поток LimeHD/Telecloud — передаем специфичные заголовки, иначе стандартные
-      const isLime =
-        targetUrl.includes("lime") || targetUrl.includes("telecloud");
-
-      const segmentHeaders = {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "*/*",
-        "Connection": "keep-alive",
-      };
-
-      if (isLime) {
-        segmentHeaders["X-LHD-Agent"] = LHD_AGENT;
-        segmentHeaders["Referer"] = "https://limehd.tv/";
-        segmentHeaders["Origin"] = "https://limehd.tv";
-      }
-
-      const segmentRes = await fetch(targetUrl, { headers: segmentHeaders });
+      const segmentRes = await fetch(targetUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          "X-LHD-Agent": LHD_AGENT,
+          "Referer": "https://limehd.tv/",
+          "Origin": "https://limehd.tv",
+          "Accept": "*/*",
+          "Connection": "keep-alive",
+        },
+      });
 
       if (!segmentRes.ok) {
+        // При ошибке сегмента сбрасываем кэш плейлистов, чтобы плеер перезапросил свежий M3U8
         m3u8Cache.clear();
         configCache.data = null;
 
+        // Отдаем чистый код 503 без текста, чтобы плеер не путал его с видеофайлом
         response.writeHead(503, corsHeaders());
         response.end();
         return;
@@ -185,7 +150,7 @@ const server = http.createServer(async (request, response) => {
         ...corsHeaders(),
         "Content-Type": "text/plain; charset=utf-8",
       });
-      response.end("IPTV Multi-Proxy (Lime + Wink) is running.");
+      response.end("Lime TV Proxy is running.");
       return;
     }
 
@@ -203,48 +168,39 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    const config = await fetchConfigs();
-    const streamUrl = config[path];
+    const config = await fetchConfig();
+    const limeStreamUrl = config[path];
 
-    if (!streamUrl) {
+    if (!limeStreamUrl) {
       response.writeHead(404, corsHeaders());
       response.end("Channel not found");
       return;
     }
 
-    const isLime =
-      streamUrl.includes("lime") || streamUrl.includes("telecloud");
-
-    const playlistHeaders = {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      "Accept": "*/*",
-      "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-      "Connection": "keep-alive",
-    };
-
-    if (isLime) {
-      playlistHeaders["X-LHD-Agent"] = LHD_AGENT;
-      playlistHeaders["Referer"] = "https://limehd.tv/";
-      playlistHeaders["Origin"] = "https://limehd.tv";
-    }
-
-    const playlistResponse = await fetch(streamUrl, {
-      headers: playlistHeaders,
+    const limeResponse = await fetch(limeStreamUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        "X-LHD-Agent": LHD_AGENT,
+        "Referer": "https://limehd.tv/",
+        "Origin": "https://limehd.tv",
+        "Accept": "*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive",
+      },
     });
 
-    if (!playlistResponse.ok) {
-      response.writeHead(playlistResponse.status, corsHeaders());
+    if (!limeResponse.ok) {
+      response.writeHead(limeResponse.status, corsHeaders());
       response.end();
       return;
     }
 
-    const rawM3u8 = await playlistResponse.text();
-    const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl);
+    const rawM3u8 = await limeResponse.text();
+    const processedM3u8 = resolveM3u8Urls(rawM3u8, limeStreamUrl);
 
     m3u8Cache.set(path, {
       content: processedM3u8,
-      expiresAt: now + 2000,
+      expiresAt: now + 2000, // Кэш плейлиста всего 2 секунды
     });
 
     response.writeHead(200, {
@@ -259,5 +215,5 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`IPTV Multi-Proxy listening on port ${PORT}`);
+  console.log(`Lime TV Proxy listening on port ${PORT}`);
 });
