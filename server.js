@@ -3,7 +3,7 @@ import { URL } from "node:url";
 
 const PORT = process.env.PORT || 3000;
 
-// Рабочий конфиг Лайма
+// Рабочий конфиг
 const LIME_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
 
@@ -52,7 +52,7 @@ function isWinkUrl(targetUrl) {
 /**
  * Подстановка заголовков:
  * - Если Wink -> заголовки Wink.
- * - В остальных случаях -> 100% ТОЧНЫЕ заголовки из вашего рабочего скрипта Лайма.
+ * - В остальных случаях -> 100% ТОЧНЫЕ заголовки из вашего рабочего скрипта Лама.
  */
 function getHeaders(targetUrl) {
   if (isWinkUrl(targetUrl)) {
@@ -66,7 +66,7 @@ function getHeaders(targetUrl) {
     };
   }
 
-  // Заголовки строго из вашего рабочего кода
+  // Заголовки строго из моего рабочего кода
   return {
     "User-Agent": "Mozilla/5.0",
     "X-LHD-Agent": LHD_AGENT,
@@ -79,7 +79,7 @@ function getHeaders(targetUrl) {
 }
 
 /**
- * Загрузка и объединение конфигов Лайма и Винка
+ * Загрузка и объединение конфигов Лама и Винка
  */
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
