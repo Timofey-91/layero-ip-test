@@ -3,13 +3,14 @@ import { URL } from "node:url";
 
 const PORT = process.env.PORT || 3000;
 
-// Источники конфигураций
+// Рабочий конфиг Лайма
 const LIME_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
+
+// Конфиг Винка
 const WINK_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/mediavitrina-proxy/raw/branch/master/wink.json";
 
-// Специальный заголовок для авторизации в CDN Lime HD
 const LHD_AGENT = JSON.stringify({
   version_name: "1.0.2.203",
   version_code: "203",
@@ -19,11 +20,9 @@ const LHD_AGENT = JSON.stringify({
   generation: "2",
 });
 
-// Кэш конфигураций и плейлистов
-let configCache = { lime: {}, wink: {}, expiresAt: 0 };
+let configCache = { data: null, expiresAt: 0 };
 const m3u8Cache = new Map();
 
-// CORS заголовки для работы любых плееров
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -36,56 +35,56 @@ function corsHeaders() {
 }
 
 /**
- * ЧЁТКОЕ РАЗДЕЛЕНИЕ ЛАЙМ И ВИНК ПО ДОМЕНАМ И ЗАГОЛОВКАМ
+ * Проверка, принадлежит ли URL к CDN Wink/Ростелеком
  */
-function getHeadersForUrl(targetUrl) {
-  const lowerUrl = targetUrl.toLowerCase();
+function isWinkUrl(targetUrl) {
+  const u = targetUrl.toLowerCase();
+  return (
+    u.includes("wink") ||
+    u.includes("rt.ru") ||
+    u.includes("mediavitrina") ||
+    u.includes("ngenix") ||
+    u.includes("cdntv") ||
+    u.includes("zabava")
+  );
+}
 
-  // Домены, принадлежащие инфраструктуре Lime HD / Telecloud
-  const isLime =
-    lowerUrl.includes("lime") ||
-    lowerUrl.includes("telecloud") ||
-    lowerUrl.includes("vse-tv") ||
-    lowerUrl.includes("lhd");
+/**
+ * Подстановка заголовков:
+ * - Если Wink -> заголовки Wink.
+ * - В остальных случаях -> 100% ТОЧНЫЕ заголовки из вашего рабочего скрипта Лайма.
+ */
+function getHeaders(targetUrl) {
+  if (isWinkUrl(targetUrl)) {
+    return {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Referer": "https://wink.ru/",
+      "Origin": "https://wink.ru",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+    };
+  }
 
-  // Домены, принадлежащие инфраструктуре Wink / Ростелеком / Ngenix / Mediavitrina
-  const isWink =
-    lowerUrl.includes("wink") ||
-    lowerUrl.includes("rt.ru") ||
-    lowerUrl.includes("mediavitrina") ||
-    lowerUrl.includes("ngenix") ||
-    lowerUrl.includes("cdntv") ||
-    lowerUrl.includes("zabava");
-
-  const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  // Заголовки строго из вашего рабочего кода
+  return {
+    "User-Agent": "Mozilla/5.0",
+    "X-LHD-Agent": LHD_AGENT,
+    "Referer": "https://limehd.tv/",
+    "Origin": "https://limehd.tv",
     "Accept": "*/*",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     "Connection": "keep-alive",
   };
-
-  if (isLime) {
-    // Заголовки строго для Лайма
-    headers["X-LHD-Agent"] = LHD_AGENT;
-    headers["Referer"] = "https://limehd.tv/";
-    headers["Origin"] = "https://limehd.tv";
-  } else if (isWink) {
-    // Заголовки строго для Винка
-    headers["Referer"] = "https://wink.ru/";
-    headers["Origin"] = "https://wink.ru";
-  }
-
-  return headers;
 }
 
 /**
- * Загрузка конфигураций с разделением на Lime и Wink
+ * Загрузка и объединение конфигов Лайма и Винка
  */
-async function fetchConfigs(forceRefresh = false) {
+async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
-  if (!forceRefresh && configCache.expiresAt > now) {
-    return configCache;
+  if (!forceRefresh && configCache.data && now < configCache.expiresAt) {
+    return configCache.data;
   }
 
   const [limeRes, winkRes] = await Promise.allSettled([
@@ -111,7 +110,7 @@ async function fetchConfigs(forceRefresh = false) {
     try {
       limeData = await limeRes.value.json();
     } catch (e) {
-      console.error("Ошибка парсинга конфига Lime:", e);
+      console.error("Lime config parse error:", e);
     }
   }
 
@@ -119,22 +118,21 @@ async function fetchConfigs(forceRefresh = false) {
     try {
       winkData = await winkRes.value.json();
     } catch (e) {
-      console.error("Ошибка парсинга конфига Wink:", e);
+      console.error("Wink config parse error:", e);
     }
   }
 
+  // Лайм в приоритете
+  const combinedData = { ...winkData, ...limeData };
+
   configCache = {
-    lime: limeData,
-    wink: winkData,
-    expiresAt: now + 30 * 1000, // Кэш конфигов на 30 секунд
+    data: combinedData,
+    expiresAt: now + 30 * 1000,
   };
 
-  return configCache;
+  return combinedData;
 }
 
-/**
- * Проверка, является ли URL ссылкой на M3U8 плейлист
- */
 function isM3u8Url(urlStr) {
   try {
     const parsed = new URL(urlStr);
@@ -149,7 +147,7 @@ function isM3u8Url(urlStr) {
 }
 
 /**
- * Преобразование ссылок внутри M3U8 плейлистов
+ * Парсинг M3U8 (точно по вашей рабочей логике с добавлением /proxy-m3u8 для Wink-плейлистов)
  */
 function resolveM3u8Urls(m3u8Text, baseUrlStr) {
   const baseUrl = new URL(baseUrlStr);
@@ -159,7 +157,6 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr) {
     const trimmed = line.trim();
     if (!trimmed) return line;
 
-    // Замена URI="..." в тегах #EXT-X-MEDIA, #EXT-X-I-FRAME, #EXT-X-KEY и т.д.
     if (trimmed.startsWith("#")) {
       return line.replace(/URI=["']([^"']+)["']/g, (match, relativeUri) => {
         try {
@@ -174,7 +171,6 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr) {
       });
     }
 
-    // Замена прямых ссылок на потоки или сегменты
     try {
       const absoluteUri = new URL(trimmed, baseUrl).toString();
       const endpoint = isM3u8Url(absoluteUri)
@@ -189,19 +185,6 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr) {
   return resolvedLines.join("\n");
 }
 
-async function handleM3u8Fetch(targetUrl) {
-  const headers = getHeadersForUrl(targetUrl);
-  const res = await fetch(targetUrl, { headers });
-
-  if (!res.ok) {
-    throw new Error(`Ошибка загрузки M3U8: status ${res.status}`);
-  }
-
-  const rawM3u8 = await res.text();
-  return resolveM3u8Urls(rawM3u8, targetUrl);
-}
-
-// Сервер HTTP
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(
@@ -215,85 +198,92 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 1. Маршрут для проксирования вложенных M3U8 плейлистов (Master / Variant Playlists)
+    // 1. Проксирование вложенных M3U8 плейлистов (Master-плейлисты для Wink)
     if (url.pathname === "/proxy-m3u8") {
       const targetUrl = url.searchParams.get("url");
+
       if (!targetUrl) {
         response.writeHead(400, corsHeaders());
-        response.end("Missing url parameter");
+        response.end();
         return;
       }
 
       try {
-        const processedM3u8 = await handleM3u8Fetch(targetUrl);
+        const subRes = await fetch(targetUrl, {
+          headers: getHeaders(targetUrl),
+        });
+
+        if (!subRes.ok) {
+          response.writeHead(subRes.status, corsHeaders());
+          response.end();
+          return;
+        }
+
+        const rawM3u8 = await subRes.text();
+        const processedM3u8 = resolveM3u8Urls(rawM3u8, targetUrl);
+
         response.writeHead(200, {
           ...corsHeaders(),
           "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
         });
         response.end(processedM3u8);
       } catch (e) {
-        m3u8Cache.clear();
-        configCache.expiresAt = 0;
         response.writeHead(503, corsHeaders());
-        response.end("M3U8 fetch failed");
+        response.end();
       }
       return;
     }
 
-    // 2. Маршрут для проксирования видеосегментов (.ts, .m4s, ключей и т.д.)
+    // 2. Проксирование сегментов
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
 
       if (!targetUrl) {
         response.writeHead(400, corsHeaders());
-        response.end("Missing url parameter");
+        response.end();
         return;
       }
 
-      const segmentHeaders = getHeadersForUrl(targetUrl);
+      const isWink = isWinkUrl(targetUrl);
+      const reqHeaders = getHeaders(targetUrl);
 
-      // Пробрасываем Range заголовок плеера для поддержки 206 Partial Content
-      if (request.headers["range"]) {
-        segmentHeaders["Range"] = request.headers["range"];
+      // Передаем Range только если это Wink (нужно для плееров на Wink CDN)
+      if (isWink && request.headers["range"]) {
+        reqHeaders["Range"] = request.headers["range"];
       }
 
-      try {
-        const segmentRes = await fetch(targetUrl, { headers: segmentHeaders });
+      const segmentRes = await fetch(targetUrl, { headers: reqHeaders });
 
-        if (!segmentRes.ok && segmentRes.status !== 206) {
-          response.writeHead(503, corsHeaders());
-          response.end("Segment request failed");
-          return;
-        }
+      const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
 
-        const arrayBuffer = await segmentRes.arrayBuffer();
-        const responseHeaders = {
-          ...corsHeaders(),
-          "Content-Type":
-            segmentRes.headers.get("content-type") || "video/mp2t",
-          "Content-Length": arrayBuffer.byteLength,
-        };
+      if (!isOk) {
+        m3u8Cache.clear();
+        configCache.data = null;
 
-        if (segmentRes.headers.get("content-range")) {
-          responseHeaders["Content-Range"] =
-            segmentRes.headers.get("content-range");
-        }
-
-        if (segmentRes.headers.get("accept-ranges")) {
-          responseHeaders["Accept-Ranges"] =
-            segmentRes.headers.get("accept-ranges");
-        }
-
-        response.writeHead(segmentRes.status, responseHeaders);
-        response.end(Buffer.from(arrayBuffer));
-      } catch (e) {
-        response.writeHead(502, corsHeaders());
-        response.end("Gateway Error");
+        response.writeHead(503, corsHeaders());
+        response.end();
+        return;
       }
+
+      const arrayBuffer = await segmentRes.arrayBuffer();
+
+      const resHeaders = {
+        ...corsHeaders(),
+        "Content-Type":
+          segmentRes.headers.get("content-type") || "video/mp2t",
+        "Content-Length": arrayBuffer.byteLength,
+      };
+
+      if (isWink && segmentRes.headers.get("content-range")) {
+        resHeaders["Content-Range"] = segmentRes.headers.get("content-range");
+      }
+
+      response.writeHead(segmentRes.status, resHeaders);
+      response.end(Buffer.from(arrayBuffer));
       return;
     }
 
-    // 3. Запрос M3U8 плейлиста по названию канала
+    // 3. Запрос M3U8 плейлиста
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
     if (!path) {
@@ -301,13 +291,12 @@ const server = http.createServer(async (request, response) => {
         ...corsHeaders(),
         "Content-Type": "text/plain; charset=utf-8",
       });
-      response.end("IPTV Multi-Proxy (Lime + Wink) is active.");
+      response.end("Lime & Wink TV Proxy is running.");
       return;
     }
 
     const now = Date.now();
 
-    // Проверка кэша готового плейлиста
     if (m3u8Cache.has(path)) {
       const cached = m3u8Cache.get(path);
       if (now < cached.expiresAt) {
@@ -320,55 +309,44 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    const configs = await fetchConfigs();
-
-    // Раздельный поиск ссылки на канал:
-    // Поддерживаются префиксы "lime_ch" или "wink_ch", а также обычный запрос "ch"
-    let streamUrl = null;
-
-    if (path.startsWith("lime_")) {
-      const realPath = path.replace(/^lime_/, "");
-      streamUrl = configs.lime[realPath];
-    } else if (path.startsWith("wink_")) {
-      const realPath = path.replace(/^wink_/, "");
-      streamUrl = configs.wink[realPath];
-    } else {
-      // При обычном запросе проверяем сначала Lime, затем Wink
-      streamUrl = configs.lime[path] || configs.wink[path];
-    }
+    const config = await fetchConfig();
+    const streamUrl = config[path];
 
     if (!streamUrl) {
       response.writeHead(404, corsHeaders());
-      response.end("Channel not found in Lime or Wink configs");
+      response.end("Channel not found");
       return;
     }
 
-    try {
-      const processedM3u8 = await handleM3u8Fetch(streamUrl);
+    const streamResponse = await fetch(streamUrl, {
+      headers: getHeaders(streamUrl),
+    });
 
-      // Кэшируем результат на 2 секунды для снижения нагрузки
-      m3u8Cache.set(path, {
-        content: processedM3u8,
-        expiresAt: now + 2000,
-      });
-
-      response.writeHead(200, {
-        ...corsHeaders(),
-        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-      });
-      response.end(processedM3u8);
-    } catch (e) {
-      m3u8Cache.clear();
-      configCache.expiresAt = 0;
-      response.writeHead(503, corsHeaders());
-      response.end("Stream fetch failed");
+    if (!streamResponse.ok) {
+      response.writeHead(streamResponse.status, corsHeaders());
+      response.end();
+      return;
     }
+
+    const rawM3u8 = await streamResponse.text();
+    const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl);
+
+    m3u8Cache.set(path, {
+      content: processedM3u8,
+      expiresAt: now + 2000,
+    });
+
+    response.writeHead(200, {
+      ...corsHeaders(),
+      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+    });
+    response.end(processedM3u8);
   } catch (error) {
     response.writeHead(500, corsHeaders());
-    response.end("Internal Server Error");
+    response.end();
   }
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`IPTV Multi-Proxy (Lime & Wink) running on port ${PORT}`);
+  console.log(`Lime & Wink Proxy listening on port ${PORT}`);
 });
