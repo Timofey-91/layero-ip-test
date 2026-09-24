@@ -5,11 +5,11 @@ const PORT = process.env.PORT || 3000;
 
 // Рабочий конфиг
 const LIME_CONFIG_URL =
-  "https://gitverse.ru";
+  "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
 
 // Конфиг Винка
 const WINK_CONFIG_URL =
-  "https://gitverse.ru";
+  "https://gitverse.ru/api/repos/Timofey91/mediavitrina-proxy/raw/branch/master/wink.json";
 
 const LHD_AGENT = JSON.stringify({
   version_name: "1.0.2.203",
