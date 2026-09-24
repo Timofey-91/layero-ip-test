@@ -266,7 +266,6 @@ const server = http.createServer(async (request, response) => {
         const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
 
         if (!isOk) {
-          // Не сбрасываем кэш конфигурации при разовой сетевой ошибке сегмента, чтобы не дергать API лишний раз
           response.writeHead(503, corsHeaders());
           response.end();
           return;
@@ -361,10 +360,13 @@ const server = http.createServer(async (request, response) => {
       response.writeHead(503, corsHeaders());
       response.end();
     }
-  });
-} catch (globalError) {
+  } catch (globalError) {
     console.error("Global server error:", globalError);
-}
+    if (!response.writableEnded) {
+      response.writeHead(500, corsHeaders());
+      response.end();
+    }
+  }
 });
 
 server.listen(PORT, () => {
