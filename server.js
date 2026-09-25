@@ -3,9 +3,6 @@ import { URL } from "node:url";
 
 const PORT = process.env.PORT || 3000;
 
-// ГЛОБАЛЬНЫЙ СЧЕТЧИК ТРАФИКА
-let totalBytesProxied = 0;
-
 // Рабочий конфиг
 const LIME_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
@@ -53,7 +50,9 @@ function isWinkUrl(targetUrl) {
 }
 
 /**
- * Подстановка заголовков
+ * Подстановка заголовков:
+ * - Если Wink -> заголовки Wink.
+ * - В остальных случаях -> 100% ТОЧНЫЕ заголовки из вашего рабочего скрипта Лама.
  */
 function getHeaders(targetUrl) {
   if (isWinkUrl(targetUrl)) {
@@ -67,6 +66,7 @@ function getHeaders(targetUrl) {
     };
   }
 
+  // Заголовки строго из моего рабочего кода
   return {
     "User-Agent": "Mozilla/5.0",
     "X-LHD-Agent": LHD_AGENT,
@@ -122,6 +122,7 @@ async function fetchConfig(forceRefresh = false) {
     }
   }
 
+  // Лайм в приоритете
   const combinedData = { ...winkData, ...limeData };
 
   configCache = {
@@ -146,7 +147,7 @@ function isM3u8Url(urlStr) {
 }
 
 /**
- * Парсинг M3U8
+ * Парсинг M3U8 (точно по вашей рабочей логике с добавлением /proxy-m3u8 для Wink-плейлистов)
  */
 function resolveM3u8Urls(m3u8Text, baseUrlStr) {
   const baseUrl = new URL(baseUrlStr);
@@ -197,25 +198,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // СТРАНИЦА СТАТИСТИКИ ТРАФИКА
-    if (url.pathname === "/stats") {
-      const mb = (totalBytesProxied / (1024 * 1024)).toFixed(2);
-      const gb = (totalBytesProxied / (1024 * 1024 * 1024)).toFixed(3);
-      
-      response.writeHead(200, {
-        ...corsHeaders(),
-        "Content-Type": "application/json; charset=utf-8",
-      });
-      response.end(JSON.stringify({
-        status: "Proxy is active",
-        bytes_proxied: totalBytesProxied,
-        megabytes_proxied: `${mb} MB`,
-        gigabytes_proxied: `${gb} GB`
-      }, null, 2));
-      return;
-    }
-
-    // 1. Проксирование вложенных M3U8 плейлистов
+    // 1. Проксирование вложенных M3U8 плейлистов (Master-плейлисты для Wink)
     if (url.pathname === "/proxy-m3u8") {
       const targetUrl = url.searchParams.get("url");
 
@@ -251,7 +234,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Проксирование сегментов (СТРОГО ВАША СТАБИЛЬНАЯ ЛОГИКА)
+    // 2. Проксирование сегментов
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
 
@@ -264,11 +247,13 @@ const server = http.createServer(async (request, response) => {
       const isWink = isWinkUrl(targetUrl);
       const reqHeaders = getHeaders(targetUrl);
 
+      // Передаем Range только если это Wink (нужно для плееров на Wink CDN)
       if (isWink && request.headers["range"]) {
         reqHeaders["Range"] = request.headers["range"];
       }
 
       const segmentRes = await fetch(targetUrl, { headers: reqHeaders });
+
       const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
 
       if (!isOk) {
@@ -281,13 +266,11 @@ const server = http.createServer(async (request, response) => {
       }
 
       const arrayBuffer = await segmentRes.arrayBuffer();
-      
-      // Считаем размер успешно скачанного сегмента
-      totalBytesProxied += arrayBuffer.byteLength;
 
       const resHeaders = {
         ...corsHeaders(),
-        "Content-Type": segmentRes.headers.get("content-type") || "video/mp2t",
+        "Content-Type":
+          segmentRes.headers.get("content-type") || "video/mp2t",
         "Content-Length": arrayBuffer.byteLength,
       };
 
@@ -301,7 +284,7 @@ const server = http.createServer(async (request, response) => {
     }
 
     // 3. Запрос M3U8 плейлиста
-    const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8\$/i, "");
+    const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
     if (!path) {
       response.writeHead(200, {
@@ -331,40 +314,39 @@ const server = http.createServer(async (request, response) => {
 
     if (!streamUrl) {
       response.writeHead(404, corsHeaders());
-      response.end("Stream not found");
+      response.end("Channel not found");
       return;
     }
 
-    try {
-      const m3u8Res = await fetch(streamUrl, { headers: getHeaders(streamUrl) });
-      if (!m3u8Res.ok) {
-        response.writeHead(m3u8Res.status, corsHeaders());
-        response.end();
-        return;
-      }
+    const streamResponse = await fetch(streamUrl, {
+      headers: getHeaders(streamUrl),
+    });
 
-      const rawM3u8 = await m3u8Res.text();
-      const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl);
-
-      m3u8Cache.set(path, {
-        content: processedM3u8,
-        expiresAt: now + 5 * 1000,
-      });
-
-      response.writeHead(200, {
-        ...corsHeaders(),
-        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-      });
-      response.end(processedM3u8);
-    } catch (e) {
-      response.writeHead(503, corsHeaders());
+    if (!streamResponse.ok) {
+      response.writeHead(streamResponse.status, corsHeaders());
       response.end();
+      return;
     }
-  } catch (globalError) {
-    console.error("Global server error:", globalError);
+
+    const rawM3u8 = await streamResponse.text();
+    const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl);
+
+    m3u8Cache.set(path, {
+      content: processedM3u8,
+      expiresAt: now + 2000,
+    });
+
+    response.writeHead(200, {
+      ...corsHeaders(),
+      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+    });
+    response.end(processedM3u8);
+  } catch (error) {
+    response.writeHead(500, corsHeaders());
+    response.end();
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Lime & Wink Proxy listening on port ${PORT}`);
 });
