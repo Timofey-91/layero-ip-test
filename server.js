@@ -34,9 +34,6 @@ function corsHeaders() {
   };
 }
 
-/**
- * Проверка, принадлежит ли URL к CDN Wink/Ростелеком
- */
 function isWinkUrl(targetUrl) {
   const u = targetUrl.toLowerCase();
   return (
@@ -49,9 +46,6 @@ function isWinkUrl(targetUrl) {
   );
 }
 
-/**
- * Подстановка заголовков в зависимости от источника
- */
 function getHeaders(targetUrl) {
   if (isWinkUrl(targetUrl)) {
     return {
@@ -75,9 +69,6 @@ function getHeaders(targetUrl) {
   };
 }
 
-/**
- * Загрузка и объединение конфигов Лайма и Винка
- */
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
   if (!forceRefresh && configCache.data && now < configCache.expiresAt) {
@@ -129,9 +120,6 @@ async function fetchConfig(forceRefresh = false) {
   return combinedData;
 }
 
-/**
- * Запрос с автоматическим повтором при сбое CDN (до 2 попыток)
- */
 async function fetchWithRetry(url, options, retries = 2) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -159,15 +147,12 @@ function isM3u8Url(urlStr) {
   }
 }
 
-/**
- * Парсинг M3U8 и резолв относительных ссылок
- */
 function resolveM3u8Urls(m3u8Text, baseUrlStr) {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
 
   const resolvedLines = lines.map((line) => {
-    const trimmed = line.trim(); // Исправлено: .trim() вместо .strip()
+    const trimmed = line.trim();
     if (!trimmed) return line;
 
     if (trimmed.startsWith("#")) {
@@ -278,9 +263,18 @@ const server = http.createServer(async (request, response) => {
       const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
 
       if (!isOk) {
+        // При 404 маскируем ответ статусом 200 (0 байт), чтобы плеер не останавливался
         if (segmentRes.status === 404) {
           m3u8Cache.clear();
           configCache.data = null;
+
+          response.writeHead(200, {
+            ...corsHeaders(),
+            "Content-Type": "video/mp2t",
+            "Content-Length": "0",
+          });
+          response.end();
+          return;
         }
 
         response.writeHead(segmentRes.status || 503, corsHeaders());
