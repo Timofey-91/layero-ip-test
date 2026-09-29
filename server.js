@@ -3,11 +3,11 @@ import { URL } from "node:url";
 
 const PORT = process.env.PORT || 3000;
 
-// Рабочий конфиг
+// Конфиг LimeHD
 const LIME_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
 
-// Конфиг Винка
+// Конфиг Wink
 const WINK_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/mediavitrina-proxy/raw/branch/master/wink.json";
 
@@ -34,6 +34,9 @@ function corsHeaders() {
   };
 }
 
+/**
+ * Проверка, принадлежит ли URL к CDN Wink/Ростелеком
+ */
 function isWinkUrl(targetUrl) {
   const u = targetUrl.toLowerCase();
   return (
@@ -46,6 +49,9 @@ function isWinkUrl(targetUrl) {
   );
 }
 
+/**
+ * Подстановка заголовков в зависимости от источника
+ */
 function getHeaders(targetUrl) {
   if (isWinkUrl(targetUrl)) {
     return {
@@ -70,7 +76,7 @@ function getHeaders(targetUrl) {
 }
 
 /**
- * Загрузка конфигов
+ * Загрузка и объединение конфигов Лама и Винка
  */
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
@@ -131,10 +137,12 @@ async function fetchWithRetry(url, options, retries = 2) {
     try {
       const res = await fetch(url, options);
       if (res.ok || res.status === 206) return res;
+      // При 404 сразу отдаем статус, так как ротированный сегмент не появится
+      if (res.status === 404) return res;
     } catch (e) {
       if (i === retries - 1) throw e;
     }
-    await new Promise((r) => setTimeout(r, 150)); // пауза 150мс перед повтором
+    await new Promise((r) => setTimeout(r, 150));
   }
   return await fetch(url, options);
 }
@@ -152,12 +160,15 @@ function isM3u8Url(urlStr) {
   }
 }
 
+/**
+ * Парсинг M3U8 и резолв относительных ссылок
+ */
 function resolveM3u8Urls(m3u8Text, baseUrlStr) {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
 
   const resolvedLines = lines.map((line) => {
-    const trimmed = line.trim();
+    const trimmed = line.strip();
     if (!trimmed) return line;
 
     if (trimmed.startsWith("#")) {
@@ -266,6 +277,12 @@ const server = http.createServer(async (request, response) => {
       const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
 
       if (!isOk) {
+        // При 404 от CDN очищаем кэш плейлиста и конфигов для моментального обновления ссылки
+        if (segmentRes.status === 404) {
+          m3u8Cache.clear();
+          configCache.data = null;
+        }
+
         response.writeHead(segmentRes.status || 503, corsHeaders());
         response.end();
         return;
@@ -337,9 +354,10 @@ const server = http.createServer(async (request, response) => {
     const rawM3u8 = await streamResponse.text();
     const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl);
 
+    // TTL 1000мс обеспечивает свежесть сегментов при частых обновлениях HLS
     m3u8Cache.set(path, {
       content: processedM3u8,
-      expiresAt: now + 2000,
+      expiresAt: now + 1000,
     });
 
     response.writeHead(200, {
@@ -355,6 +373,6 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Lime & Wink Proxy listening on port ${PORT}`);
-  // Предварительный прогрев кэша при старте
+  // Прогрев кэша конфигураций при старте
   fetchConfig().catch(() => {});
 });
