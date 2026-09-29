@@ -47,8 +47,16 @@ function isWinkUrl(targetUrl) {
 }
 
 function getHeaders(targetUrl) {
+  // Базовые заголовки против застревания устаревших M3U8 на промежточных CDN
+  const baseHeaders = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+  };
+
   if (isWinkUrl(targetUrl)) {
     return {
+      ...baseHeaders,
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "Referer": "https://wink.ru/",
@@ -59,7 +67,8 @@ function getHeaders(targetUrl) {
   }
 
   return {
-    "User-Agent": "Mozilla/5.0",
+    ...baseHeaders,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "X-LHD-Agent": LHD_AGENT,
     "Referer": "https://limehd.tv/",
     "Origin": "https://limehd.tv",
@@ -304,20 +313,8 @@ const server = http.createServer(async (request, response) => {
       const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
 
       if (!isOk) {
-        // При 404 маскируем ответ статусом 200 (0 байт), чтобы плеер не останавливался
-        if (segmentRes.status === 404) {
-          m3u8Cache.clear();
-          configCache.data = null;
-
-          response.writeHead(200, {
-            ...corsHeaders(),
-            "Content-Type": "video/mp2t",
-            "Content-Length": "0",
-          });
-          response.end();
-          return;
-        }
-
+        // ВАЖНО: Если статус не 200/206 (например 404), отдаем реальный код ошибки.
+        // Не возвращаем 200 OK с 0 байт, чтобы VLC не засыпал из-за битого TS-файла.
         response.writeHead(segmentRes.status || 503, corsHeaders());
         response.end();
         return;
@@ -341,7 +338,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 3. Запрос M3U8 плейлиста
+    // 3. Запрос M3U8 плейлиста канала
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
     if (!path) {
