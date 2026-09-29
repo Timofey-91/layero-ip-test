@@ -76,7 +76,7 @@ function getHeaders(targetUrl) {
 }
 
 /**
- * Загрузка и объединение конфигов Лама и Винка
+ * Загрузка и объединение конфигов Лайма и Винка
  */
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
@@ -137,7 +137,6 @@ async function fetchWithRetry(url, options, retries = 2) {
     try {
       const res = await fetch(url, options);
       if (res.ok || res.status === 206) return res;
-      // При 404 сразу отдаем статус, так как ротированный сегмент не появится
       if (res.status === 404) return res;
     } catch (e) {
       if (i === retries - 1) throw e;
@@ -168,7 +167,7 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr) {
   const lines = m3u8Text.split("\n");
 
   const resolvedLines = lines.map((line) => {
-    const trimmed = line.strip();
+    const trimmed = line.trim(); // Исправлено: .trim() вместо .strip()
     if (!trimmed) return line;
 
     if (trimmed.startsWith("#")) {
@@ -242,6 +241,7 @@ const server = http.createServer(async (request, response) => {
         });
         response.end(processedM3u8);
       } catch (e) {
+        console.error("Error proxying m3u8:", e);
         response.writeHead(503, corsHeaders());
         response.end();
       }
@@ -269,6 +269,7 @@ const server = http.createServer(async (request, response) => {
       try {
         segmentRes = await fetchWithRetry(targetUrl, { headers: reqHeaders });
       } catch (e) {
+        console.error("Error proxying segment:", e);
         response.writeHead(503, corsHeaders());
         response.end();
         return;
@@ -277,7 +278,6 @@ const server = http.createServer(async (request, response) => {
       const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
 
       if (!isOk) {
-        // При 404 от CDN очищаем кэш плейлиста и конфигов для моментального обновления ссылки
         if (segmentRes.status === 404) {
           m3u8Cache.clear();
           configCache.data = null;
@@ -354,7 +354,6 @@ const server = http.createServer(async (request, response) => {
     const rawM3u8 = await streamResponse.text();
     const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl);
 
-    // TTL 1000мс обеспечивает свежесть сегментов при частых обновлениях HLS
     m3u8Cache.set(path, {
       content: processedM3u8,
       expiresAt: now + 1000,
@@ -366,6 +365,7 @@ const server = http.createServer(async (request, response) => {
     });
     response.end(processedM3u8);
   } catch (error) {
+    console.error("Unhandled Server Error:", error);
     response.writeHead(500, corsHeaders());
     response.end();
   }
@@ -373,6 +373,5 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Lime & Wink Proxy listening on port ${PORT}`);
-  // Прогрев кэша конфигураций при старте
   fetchConfig().catch(() => {});
 });
