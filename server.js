@@ -34,9 +34,6 @@ function corsHeaders() {
   };
 }
 
-/**
- * Проверка, принадлежит ли URL к CDN Wink/Ростелеком
- */
 function isWinkUrl(targetUrl) {
   const u = targetUrl.toLowerCase();
   return (
@@ -49,11 +46,6 @@ function isWinkUrl(targetUrl) {
   );
 }
 
-/**
- * Подстановка заголовков:
- * - Если Wink -> заголовки Wink.
- * - В остальных случаях -> 100% ТОЧНЫЕ заголовки из вашего рабочего скрипта Лама.
- */
 function getHeaders(targetUrl) {
   if (isWinkUrl(targetUrl)) {
     return {
@@ -66,7 +58,6 @@ function getHeaders(targetUrl) {
     };
   }
 
-  // Заголовки строго из моего рабочего кода
   return {
     "User-Agent": "Mozilla/5.0",
     "X-LHD-Agent": LHD_AGENT,
@@ -79,7 +70,7 @@ function getHeaders(targetUrl) {
 }
 
 /**
- * Загрузка и объединение конфигов Лама и Винка
+ * Загрузка конфигов
  */
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
@@ -122,7 +113,6 @@ async function fetchConfig(forceRefresh = false) {
     }
   }
 
-  // Лайм в приоритете
   const combinedData = { ...winkData, ...limeData };
 
   configCache = {
@@ -131,6 +121,22 @@ async function fetchConfig(forceRefresh = false) {
   };
 
   return combinedData;
+}
+
+/**
+ * Запрос с автоматическим повтором при сбое CDN (до 2 попыток)
+ */
+async function fetchWithRetry(url, options, retries = 2) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.ok || res.status === 206) return res;
+    } catch (e) {
+      if (i === retries - 1) throw e;
+    }
+    await new Promise((r) => setTimeout(r, 150)); // пауза 150мс перед повтором
+  }
+  return await fetch(url, options);
 }
 
 function isM3u8Url(urlStr) {
@@ -146,9 +152,6 @@ function isM3u8Url(urlStr) {
   }
 }
 
-/**
- * Парсинг M3U8 (точно по вашей рабочей логике с добавлением /proxy-m3u8 для Wink-плейлистов)
- */
 function resolveM3u8Urls(m3u8Text, baseUrlStr) {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
@@ -198,7 +201,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 1. Проксирование вложенных M3U8 плейлистов (Master-плейлисты для Wink)
+    // 1. Проксирование вложенных M3U8 плейлистов
     if (url.pathname === "/proxy-m3u8") {
       const targetUrl = url.searchParams.get("url");
 
@@ -209,7 +212,7 @@ const server = http.createServer(async (request, response) => {
       }
 
       try {
-        const subRes = await fetch(targetUrl, {
+        const subRes = await fetchWithRetry(targetUrl, {
           headers: getHeaders(targetUrl),
         });
 
@@ -247,20 +250,23 @@ const server = http.createServer(async (request, response) => {
       const isWink = isWinkUrl(targetUrl);
       const reqHeaders = getHeaders(targetUrl);
 
-      // Передаем Range только если это Wink (нужно для плееров на Wink CDN)
       if (isWink && request.headers["range"]) {
         reqHeaders["Range"] = request.headers["range"];
       }
 
-      const segmentRes = await fetch(targetUrl, { headers: reqHeaders });
+      let segmentRes;
+      try {
+        segmentRes = await fetchWithRetry(targetUrl, { headers: reqHeaders });
+      } catch (e) {
+        response.writeHead(503, corsHeaders());
+        response.end();
+        return;
+      }
 
       const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
 
       if (!isOk) {
-        m3u8Cache.clear();
-        configCache.data = null;
-
-        response.writeHead(503, corsHeaders());
+        response.writeHead(segmentRes.status || 503, corsHeaders());
         response.end();
         return;
       }
@@ -318,7 +324,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    const streamResponse = await fetch(streamUrl, {
+    const streamResponse = await fetchWithRetry(streamUrl, {
       headers: getHeaders(streamUrl),
     });
 
@@ -349,4 +355,6 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Lime & Wink Proxy listening on port ${PORT}`);
+  // Предварительный прогрев кэша при старте
+  fetchConfig().catch(() => {});
 });
