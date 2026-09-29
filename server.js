@@ -69,70 +69,111 @@ function getHeaders(targetUrl) {
   };
 }
 
+// Запрос с таймаутом (2.5 сек) и повторами — чтобы сервер не вис на 10 секунд
+async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      const res = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      if (res.ok || res.status === 206 || res.status === 404) return res;
+    } catch (e) {
+      if (i === retries - 1) throw e;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    return res;
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
+  }
+}
+
+// Загрузка конфигов с поддержкой Stale-While-Revalidate (SWR)
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
+
   if (!forceRefresh && configCache.data && now < configCache.expiresAt) {
     return configCache.data;
   }
 
-  const [limeRes, winkRes] = await Promise.allSettled([
-    fetch(LIME_CONFIG_URL, {
-      headers: {
-        "Cache-Control": "no-cache, no-store",
-        "User-Agent": "Mozilla/5.0",
-        "X-LHD-Agent": LHD_AGENT,
-      },
-    }),
-    fetch(WINK_CONFIG_URL, {
-      headers: {
-        "Cache-Control": "no-cache, no-store",
-        "User-Agent": "Mozilla/5.0",
-      },
-    }),
-  ]);
+  const refreshInBackground = async () => {
+    const [limeRes, winkRes] = await Promise.allSettled([
+      fetchWithRetry(
+        LIME_CONFIG_URL,
+        {
+          headers: {
+            "Cache-Control": "no-cache, no-store",
+            "User-Agent": "Mozilla/5.0",
+            "X-LHD-Agent": LHD_AGENT,
+          },
+        },
+        1,
+        3000
+      ),
+      fetchWithRetry(
+        WINK_CONFIG_URL,
+        {
+          headers: {
+            "Cache-Control": "no-cache, no-store",
+            "User-Agent": "Mozilla/5.0",
+          },
+        },
+        1,
+        3000
+      ),
+    ]);
 
-  let limeData = {};
-  let winkData = {};
+    let limeData = {};
+    let winkData = {};
 
-  if (limeRes.status === "fulfilled" && limeRes.value.ok) {
-    try {
-      limeData = await limeRes.value.json();
-    } catch (e) {
-      console.error("Lime config parse error:", e);
+    if (limeRes.status === "fulfilled" && limeRes.value.ok) {
+      try {
+        limeData = await limeRes.value.json();
+      } catch (e) {}
     }
-  }
 
-  if (winkRes.status === "fulfilled" && winkRes.value.ok) {
-    try {
-      winkData = await winkRes.value.json();
-    } catch (e) {
-      console.error("Wink config parse error:", e);
+    if (winkRes.status === "fulfilled" && winkRes.value.ok) {
+      try {
+        winkData = await winkRes.value.json();
+      } catch (e) {}
     }
-  }
 
-  const combinedData = { ...winkData, ...limeData };
+    const combinedData = { ...winkData, ...limeData };
 
-  configCache = {
-    data: combinedData,
-    expiresAt: now + 30 * 1000,
+    if (Object.keys(combinedData).length > 0) {
+      configCache = {
+        data: combinedData,
+        expiresAt: Date.now() + 30 * 1000,
+      };
+    }
+    return combinedData;
   };
 
-  return combinedData;
+  if (configCache.data && Object.keys(configCache.data).length > 0) {
+    refreshInBackground().catch(() => {});
+    return configCache.data;
+  }
+
+  return await refreshInBackground();
 }
 
-async function fetchWithRetry(url, options, retries = 2) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const res = await fetch(url, options);
-      if (res.ok || res.status === 206) return res;
-      if (res.status === 404) return res;
-    } catch (e) {
-      if (i === retries - 1) throw e;
-    }
-    await new Promise((r) => setTimeout(r, 150));
-  }
-  return await fetch(url, options);
-}
+// Фоновый прогрев каждые 4 минуты
+setInterval(() => {
+  fetchConfig(true).catch(() => {});
+}, 4 * 60 * 1000);
 
 function isM3u8Url(urlStr) {
   try {
@@ -226,7 +267,7 @@ const server = http.createServer(async (request, response) => {
         });
         response.end(processedM3u8);
       } catch (e) {
-        console.error("Error proxying m3u8:", e);
+        console.error("Error proxying m3u8:", e.message);
         response.writeHead(503, corsHeaders());
         response.end();
       }
@@ -254,7 +295,7 @@ const server = http.createServer(async (request, response) => {
       try {
         segmentRes = await fetchWithRetry(targetUrl, { headers: reqHeaders });
       } catch (e) {
-        console.error("Error proxying segment:", e);
+        console.error("Error proxying segment:", e.message);
         response.writeHead(503, corsHeaders());
         response.end();
         return;
@@ -313,10 +354,54 @@ const server = http.createServer(async (request, response) => {
     }
 
     const now = Date.now();
+    const cached = m3u8Cache.get(path);
 
-    if (m3u8Cache.has(path)) {
-      const cached = m3u8Cache.get(path);
-      if (now < cached.expiresAt) {
+    // Если кэш свежий (меньше 1 сек) — отдаем мгновенно
+    if (cached && now < cached.expiresAt) {
+      response.writeHead(200, {
+        ...corsHeaders(),
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+      });
+      response.end(cached.content);
+      return;
+    }
+
+    try {
+      const config = await fetchConfig();
+      const streamUrl = config[path];
+
+      if (!streamUrl) {
+        response.writeHead(404, corsHeaders());
+        response.end("Channel not found");
+        return;
+      }
+
+      const streamResponse = await fetchWithRetry(streamUrl, {
+        headers: getHeaders(streamUrl),
+      });
+
+      if (!streamResponse.ok) {
+        throw new Error(`CDN status ${streamResponse.status}`);
+      }
+
+      const rawM3u8 = await streamResponse.text();
+      const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl);
+
+      m3u8Cache.set(path, {
+        content: processedM3u8,
+        expiresAt: now + 1000,
+      });
+
+      response.writeHead(200, {
+        ...corsHeaders(),
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+      });
+      response.end(processedM3u8);
+    } catch (error) {
+      console.error(`Error fetching M3U8 for ${path}:`, error.message);
+
+      // Если CDN подвис/выдал ошибку, отдаём предыдущий кэш, чтобы картинка не вставала
+      if (cached && cached.content) {
         response.writeHead(200, {
           ...corsHeaders(),
           "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
@@ -324,40 +409,10 @@ const server = http.createServer(async (request, response) => {
         response.end(cached.content);
         return;
       }
-    }
 
-    const config = await fetchConfig();
-    const streamUrl = config[path];
-
-    if (!streamUrl) {
-      response.writeHead(404, corsHeaders());
-      response.end("Channel not found");
-      return;
-    }
-
-    const streamResponse = await fetchWithRetry(streamUrl, {
-      headers: getHeaders(streamUrl),
-    });
-
-    if (!streamResponse.ok) {
-      response.writeHead(streamResponse.status, corsHeaders());
+      response.writeHead(503, corsHeaders());
       response.end();
-      return;
     }
-
-    const rawM3u8 = await streamResponse.text();
-    const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl);
-
-    m3u8Cache.set(path, {
-      content: processedM3u8,
-      expiresAt: now + 1000,
-    });
-
-    response.writeHead(200, {
-      ...corsHeaders(),
-      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-    });
-    response.end(processedM3u8);
   } catch (error) {
     console.error("Unhandled Server Error:", error);
     response.writeHead(500, corsHeaders());
