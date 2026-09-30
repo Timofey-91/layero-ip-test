@@ -47,7 +47,6 @@ function isWinkUrl(targetUrl) {
 }
 
 function getHeaders(targetUrl) {
-  // Базовые заголовки против застревания устаревших M3U8 на промежточных CDN
   const baseHeaders = {
     "Cache-Control": "no-cache, no-store, must-revalidate",
     "Pragma": "no-cache",
@@ -78,7 +77,6 @@ function getHeaders(targetUrl) {
   };
 }
 
-// Запрос с таймаутом (2.5 сек) и повторами — чтобы сервер не вис на 10 секунд
 async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -110,7 +108,6 @@ async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) 
   }
 }
 
-// Загрузка конфигов с поддержкой Stale-While-Revalidate (SWR)
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
 
@@ -162,13 +159,14 @@ async function fetchConfig(forceRefresh = false) {
 
     const combinedData = { ...winkData, ...limeData };
 
+    // Накладываем новые данные поверх старых, чтобы не терять списки при сбоях GitVerse
     if (Object.keys(combinedData).length > 0) {
       configCache = {
-        data: combinedData,
-        expiresAt: Date.now() + 30 * 1000,
+        data: { ...(configCache.data || {}), ...combinedData },
+        expiresAt: Date.now() + 60 * 1000, // Кэшируем конфиг на 60 сек
       };
     }
-    return combinedData;
+    return configCache.data || combinedData;
   };
 
   if (configCache.data && Object.keys(configCache.data).length > 0) {
@@ -179,7 +177,6 @@ async function fetchConfig(forceRefresh = false) {
   return await refreshInBackground();
 }
 
-// Фоновый прогрев каждые 4 минуты
 setInterval(() => {
   fetchConfig(true).catch(() => {});
 }, 4 * 60 * 1000);
@@ -313,8 +310,6 @@ const server = http.createServer(async (request, response) => {
       const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
 
       if (!isOk) {
-        // ВАЖНО: Если статус не 200/206 (например 404), отдаем реальный код ошибки.
-        // Не возвращаем 200 OK с 0 байт, чтобы VLC не засыпал из-за битого TS-файла.
         response.writeHead(segmentRes.status || 503, corsHeaders());
         response.end();
         return;
@@ -341,6 +336,7 @@ const server = http.createServer(async (request, response) => {
     // 3. Запрос M3U8 плейлиста канала
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
+    // Корень / - для пинга от Layero (Health Check)
     if (!path) {
       response.writeHead(200, {
         ...corsHeaders(),
@@ -353,7 +349,6 @@ const server = http.createServer(async (request, response) => {
     const now = Date.now();
     const cached = m3u8Cache.get(path);
 
-    // Если кэш свежий (меньше 1 сек) — отдаем мгновенно
     if (cached && now < cached.expiresAt) {
       response.writeHead(200, {
         ...corsHeaders(),
@@ -367,9 +362,21 @@ const server = http.createServer(async (request, response) => {
       const config = await fetchConfig();
       const streamUrl = config[path];
 
+      // Если урла нет в конфиге (например, GitVerse временно задерживает ответ)
       if (!streamUrl) {
-        response.writeHead(404, corsHeaders());
-        response.end("Channel not found");
+        // Запасной вариант: отдаем старый кэшированный M3U8, если он есть
+        if (cached && cached.content) {
+          response.writeHead(200, {
+            ...corsHeaders(),
+            "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+          });
+          response.end(cached.content);
+          return;
+        }
+
+        // Возвращаем 503 вместо 404, чтобы плеер совершил повторную попытку
+        response.writeHead(503, corsHeaders());
+        response.end();
         return;
       }
 
@@ -397,7 +404,6 @@ const server = http.createServer(async (request, response) => {
     } catch (error) {
       console.error(`Error fetching M3U8 for ${path}:`, error.message);
 
-      // Если CDN подвис/выдал ошибку, отдаём предыдущий кэш, чтобы картинка не вставала
       if (cached && cached.content) {
         response.writeHead(200, {
           ...corsHeaders(),
