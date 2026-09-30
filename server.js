@@ -1,5 +1,6 @@
 import http from "node:http";
 import { URL } from "node:url";
+import { Readable } from "node:stream";
 
 const PORT = process.env.PORT || 3000;
 
@@ -159,11 +160,10 @@ async function fetchConfig(forceRefresh = false) {
 
     const combinedData = { ...winkData, ...limeData };
 
-    // Накладываем новые данные поверх старых, чтобы не терять списки при сбоях GitVerse
     if (Object.keys(combinedData).length > 0) {
       configCache = {
         data: { ...(configCache.data || {}), ...combinedData },
-        expiresAt: Date.now() + 60 * 1000, // Кэшируем конфиг на 60 сек
+        expiresAt: Date.now() + 60 * 1000,
       };
     }
     return configCache.data || combinedData;
@@ -280,7 +280,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Проксирование сегментов
+    // 2. Проксирование сегментов (Stream / Pipe без накопления в RAM)
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
 
@@ -315,21 +315,28 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      const arrayBuffer = await segmentRes.arrayBuffer();
-
       const resHeaders = {
         ...corsHeaders(),
         "Content-Type":
           segmentRes.headers.get("content-type") || "video/mp2t",
-        "Content-Length": arrayBuffer.byteLength,
       };
+
+      const contentLength = segmentRes.headers.get("content-length");
+      if (contentLength) {
+        resHeaders["Content-Length"] = contentLength;
+      }
 
       if (isWink && segmentRes.headers.get("content-range")) {
         resHeaders["Content-Range"] = segmentRes.headers.get("content-range");
       }
 
       response.writeHead(segmentRes.status, resHeaders);
-      response.end(Buffer.from(arrayBuffer));
+
+      if (segmentRes.body) {
+        Readable.fromWeb(segmentRes.body).pipe(response);
+      } else {
+        response.end();
+      }
       return;
     }
 
@@ -362,9 +369,7 @@ const server = http.createServer(async (request, response) => {
       const config = await fetchConfig();
       const streamUrl = config[path];
 
-      // Если урла нет в конфиге (например, GitVerse временно задерживает ответ)
       if (!streamUrl) {
-        // Запасной вариант: отдаем старый кэшированный M3U8, если он есть
         if (cached && cached.content) {
           response.writeHead(200, {
             ...corsHeaders(),
@@ -374,7 +379,6 @@ const server = http.createServer(async (request, response) => {
           return;
         }
 
-        // Возвращаем 503 вместо 404, чтобы плеер совершил повторную попытку
         response.writeHead(503, corsHeaders());
         response.end();
         return;
