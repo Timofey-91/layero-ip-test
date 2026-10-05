@@ -4,8 +4,11 @@ import { Readable } from "node:stream";
 
 const PORT = process.env.PORT || 3000;
 
-// Список разрешенных ключей устройств (можно изменить на свои секретные значения)
-const ALLOWED_DEVICES = new Set(["tv1", "tv2"]);
+// URL секретного файла Gist читается из переменных окружения Layero
+const DEVICES_CONFIG_URL = process.env.DEVICES_CONFIG_URL;
+
+// Множество разрешенных ключей устройств
+let ALLOWED_DEVICES = new Set();
 
 // Конфиг LimeHD
 const LIME_CONFIG_URL =
@@ -112,6 +115,33 @@ async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) 
   }
 }
 
+// Подгрузка списка разрешенных ключей устройств из Secret Gist
+async function fetchAllowedDevices() {
+  if (!DEVICES_CONFIG_URL) {
+    console.error("[Devices] Переменная DEVICES_CONFIG_URL не задана в Layero!");
+    return;
+  }
+
+  try {
+    const res = await fetchWithRetry(
+      DEVICES_CONFIG_URL,
+      { headers: { "Cache-Control": "no-cache, no-store" } },
+      1,
+      3000
+    );
+
+    if (res.ok) {
+      const devicesArray = await res.json();
+      if (Array.isArray(devicesArray) && devicesArray.length > 0) {
+        ALLOWED_DEVICES = new Set(devicesArray.map((d) => String(d).trim()));
+        console.log(`[Devices] Загружено разрешенных ключей: ${ALLOWED_DEVICES.size}`);
+      }
+    }
+  } catch (e) {
+    console.error("[Devices] Ошибка загрузки списка устройств из Gist:", e.message);
+  }
+}
+
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
 
@@ -180,9 +210,15 @@ async function fetchConfig(forceRefresh = false) {
   return await refreshInBackground();
 }
 
+// Обновление конфигов каналов раз в 4 минуты
 setInterval(() => {
   fetchConfig(true).catch(() => {});
 }, 4 * 60 * 1000);
+
+// Авто-обновление ключей устройств из Secret Gist каждые 5 минут
+setInterval(() => {
+  fetchAllowedDevices().catch(() => {});
+}, 5 * 60 * 1000);
 
 function isM3u8Url(urlStr) {
   try {
@@ -197,7 +233,7 @@ function isM3u8Url(urlStr) {
   }
 }
 
-// Передаем devKey, чтобы привязать его к переписанным ссылкам на сегменты
+// Приписывает параметр &dev=key к переписанным ссылкам на сегменты и плейлисты
 function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
@@ -242,14 +278,14 @@ const server = http.createServer(async (request, response) => {
       `http://${request.headers.host || "localhost"}`
     );
 
-    // Разрешаем CORS предзапросы
+    // 1. CORS Preflight
     if (request.method === "OPTIONS") {
       response.writeHead(204, corsHeaders());
       response.end();
       return;
     }
 
-    // Заглушка для роботов и сканеров
+    // 2. Отбивку поисковых ботов
     if (url.pathname === "/robots.txt") {
       response.writeHead(200, {
         ...corsHeaders(),
@@ -259,7 +295,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // Корень / - для Health Check от Layero (без проверки ключа)
+    // 3. Корень / - Пинг для Health Check от Layero (без проверки ключей)
     if (url.pathname === "/" || url.pathname === "") {
       response.writeHead(200, {
         ...corsHeaders(),
@@ -269,7 +305,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // ПРОВЕРКА КЛЮЧА УСТРОЙСТВА для всех остальных запросов
+    // 4. Проверка ключа устройства
     const devKey = url.searchParams.get("dev");
     if (!devKey || !ALLOWED_DEVICES.has(devKey)) {
       response.writeHead(403, corsHeaders());
@@ -277,7 +313,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 1. Проксирование вложенных M3U8 плейлистов
+    // 5. Проксирование вложенных M3U8
     if (url.pathname === "/proxy-m3u8") {
       const targetUrl = url.searchParams.get("url");
 
@@ -314,7 +350,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Проксирование сегментов
+    // 6. Проксирование сегментов
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
 
@@ -374,7 +410,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 3. Запрос M3U8 плейлиста канала
+    // 7. Запрос M3U8 плейлиста канала
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
     const now = Date.now();
@@ -455,4 +491,5 @@ const server = http.createServer(async (request, response) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Lime & Wink Proxy listening on port ${PORT}`);
   fetchConfig().catch(() => {});
+  fetchAllowedDevices().catch(() => {});
 });
