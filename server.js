@@ -4,6 +4,9 @@ import { Readable } from "node:stream";
 
 const PORT = process.env.PORT || 3000;
 
+// Список разрешенных ключей устройств (можно изменить на свои секретные значения)
+const ALLOWED_DEVICES = new Set(["tv1", "tv2"]);
+
 // Конфиг LimeHD
 const LIME_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
@@ -194,9 +197,11 @@ function isM3u8Url(urlStr) {
   }
 }
 
-function resolveM3u8Urls(m3u8Text, baseUrlStr) {
+// Передаем devKey, чтобы привязать его к переписанным ссылкам на сегменты
+function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
+  const devParam = devKey ? `&dev=${encodeURIComponent(devKey)}` : "";
 
   const resolvedLines = lines.map((line) => {
     const trimmed = line.trim();
@@ -209,7 +214,7 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr) {
           const endpoint = isM3u8Url(absoluteUri)
             ? "/proxy-m3u8"
             : "/proxy-segment";
-          return `URI="${endpoint}?url=${encodeURIComponent(absoluteUri)}"`;
+          return `URI="${endpoint}?url=${encodeURIComponent(absoluteUri)}${devParam}"`;
         } catch {
           return match;
         }
@@ -221,7 +226,7 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr) {
       const endpoint = isM3u8Url(absoluteUri)
         ? "/proxy-m3u8"
         : "/proxy-segment";
-      return `${endpoint}?url=${encodeURIComponent(absoluteUri)}`;
+      return `${endpoint}?url=${encodeURIComponent(absoluteUri)}${devParam}`;
     } catch {
       return line;
     }
@@ -237,9 +242,38 @@ const server = http.createServer(async (request, response) => {
       `http://${request.headers.host || "localhost"}`
     );
 
+    // Разрешаем CORS предзапросы
     if (request.method === "OPTIONS") {
       response.writeHead(204, corsHeaders());
       response.end();
+      return;
+    }
+
+    // Заглушка для роботов и сканеров
+    if (url.pathname === "/robots.txt") {
+      response.writeHead(200, {
+        ...corsHeaders(),
+        "Content-Type": "text/plain; charset=utf-8",
+      });
+      response.end("User-agent: *\nDisallow: /");
+      return;
+    }
+
+    // Корень / - для Health Check от Layero (без проверки ключа)
+    if (url.pathname === "/" || url.pathname === "") {
+      response.writeHead(200, {
+        ...corsHeaders(),
+        "Content-Type": "text/plain; charset=utf-8",
+      });
+      response.end("Lime & Wink TV Proxy is running.");
+      return;
+    }
+
+    // ПРОВЕРКА КЛЮЧА УСТРОЙСТВА для всех остальных запросов
+    const devKey = url.searchParams.get("dev");
+    if (!devKey || !ALLOWED_DEVICES.has(devKey)) {
+      response.writeHead(403, corsHeaders());
+      response.end("Access Denied: Invalid device key");
       return;
     }
 
@@ -265,7 +299,7 @@ const server = http.createServer(async (request, response) => {
         }
 
         const rawM3u8 = await subRes.text();
-        const processedM3u8 = resolveM3u8Urls(rawM3u8, targetUrl);
+        const processedM3u8 = resolveM3u8Urls(rawM3u8, targetUrl, devKey);
 
         response.writeHead(200, {
           ...corsHeaders(),
@@ -280,7 +314,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Проксирование сегментов (Stream / Pipe без накопления в RAM)
+    // 2. Проксирование сегментов
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
 
@@ -343,18 +377,9 @@ const server = http.createServer(async (request, response) => {
     // 3. Запрос M3U8 плейлиста канала
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
-    // Корень / - для пинга от Layero (Health Check)
-    if (!path) {
-      response.writeHead(200, {
-        ...corsHeaders(),
-        "Content-Type": "text/plain; charset=utf-8",
-      });
-      response.end("Lime & Wink TV Proxy is running.");
-      return;
-    }
-
     const now = Date.now();
-    const cached = m3u8Cache.get(path);
+    const cachedKey = `${path}_${devKey}`;
+    const cached = m3u8Cache.get(cachedKey);
 
     if (cached && now < cached.expiresAt) {
       response.writeHead(200, {
@@ -393,9 +418,9 @@ const server = http.createServer(async (request, response) => {
       }
 
       const rawM3u8 = await streamResponse.text();
-      const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl);
+      const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl, devKey);
 
-      m3u8Cache.set(path, {
+      m3u8Cache.set(cachedKey, {
         content: processedM3u8,
         expiresAt: now + 1000,
       });
