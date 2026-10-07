@@ -85,6 +85,7 @@ function getHeaders(targetUrl) {
 }
 
 async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) {
+  let lastError;
   for (let i = 0; i < retries; i++) {
     try {
       const controller = new AbortController();
@@ -97,28 +98,21 @@ async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) 
       clearTimeout(timer);
 
       if (res.ok || res.status === 206 || res.status === 404) return res;
+      lastError = new Error(`HTTP status ${res.status}`);
     } catch (e) {
-      if (i === retries - 1) throw e;
+      lastError = e;
     }
-    await new Promise((r) => setTimeout(r, 100));
+    if (i < retries - 1) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
   }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(timer);
-    return res;
-  } catch (e) {
-    clearTimeout(timer);
-    throw e;
-  }
+  throw lastError || new Error(`Failed to fetch ${url}`);
 }
 
 // Подгрузка списка разрешенных ключей устройств из Secret Gist
 async function fetchAllowedDevices() {
   if (!DEVICES_CONFIG_URL) {
-    console.error("[Devices] Переменная DEVICES_CONFIG_URL не задана в Layero!");
+    console.warn("[Devices] Переменная DEVICES_CONFIG_URL не задана в Layero, проверка ключей отключена.");
     return;
   }
 
@@ -126,13 +120,13 @@ async function fetchAllowedDevices() {
     const res = await fetchWithRetry(
       DEVICES_CONFIG_URL,
       { headers: { "Cache-Control": "no-cache, no-store" } },
-      1,
+      2,
       3000
     );
 
     if (res.ok) {
       const devicesArray = await res.json();
-      if (Array.isArray(devicesArray) && devicesArray.length > 0) {
+      if (Array.isArray(devicesArray)) {
         ALLOWED_DEVICES = new Set(devicesArray.map((d) => String(d).trim()));
         console.log(`[Devices] Загружено разрешенных ключей: ${ALLOWED_DEVICES.size}`);
       }
@@ -160,7 +154,7 @@ async function fetchConfig(forceRefresh = false) {
             "X-LHD-Agent": LHD_AGENT,
           },
         },
-        1,
+        2,
         3000
       ),
       fetchWithRetry(
@@ -171,7 +165,7 @@ async function fetchConfig(forceRefresh = false) {
             "User-Agent": "Mozilla/5.0",
           },
         },
-        1,
+        2,
         3000
       ),
     ]);
@@ -271,11 +265,25 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   return resolvedLines.join("\n");
 }
 
+// Генерация M3U плейлиста со всеми доступными каналами
+function generatePlaylist(config, host, devKey = "") {
+  const lines = ["#EXTM3U"];
+  const devParam = devKey ? `?dev=${encodeURIComponent(devKey)}` : "";
+
+  for (const channelId of Object.keys(config)) {
+    lines.push(`#EXTINF:-1 tvg-id="${channelId}" tvg-name="${channelId}",${channelId}`);
+    lines.push(`http://${host}/${channelId}.m3u8${devParam}`);
+  }
+
+  return lines.join("\n");
+}
+
 const server = http.createServer(async (request, response) => {
   try {
+    const hostHeader = request.headers.host || "localhost";
     const url = new URL(
       request.url,
-      `http://${request.headers.host || "localhost"}`
+      `http://${hostHeader}`
     );
 
     // 1. CORS Preflight
@@ -285,7 +293,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Отбивку поисковых ботов
+    // 2. Отбивка поисковых ботов
     if (url.pathname === "/robots.txt") {
       response.writeHead(200, {
         ...corsHeaders(),
@@ -305,15 +313,34 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 4. Проверка ключа устройства
+    // 4. Проверка ключа устройства (выполняется, только если переменная Gist задана)
     const devKey = url.searchParams.get("dev");
-    if (!devKey || !ALLOWED_DEVICES.has(devKey)) {
-      response.writeHead(403, corsHeaders());
-      response.end("Access Denied: Invalid device key");
+    if (DEVICES_CONFIG_URL && ALLOWED_DEVICES.size > 0) {
+      if (!devKey || !ALLOWED_DEVICES.has(devKey)) {
+        response.writeHead(403, corsHeaders());
+        response.end("Access Denied: Invalid device key");
+        return;
+      }
+    }
+
+    // 5. Выгрузка M3U плейлиста для IPTV-плееров (/playlist.m3u, /playlist.m3u8, /m3u)
+    if (
+      url.pathname === "/playlist.m3u" ||
+      url.pathname === "/playlist.m3u8" ||
+      url.pathname === "/m3u"
+    ) {
+      const config = await fetchConfig();
+      const playlistContent = generatePlaylist(config, hostHeader, devKey);
+
+      response.writeHead(200, {
+        ...corsHeaders(),
+        "Content-Type": "application/x-mpegurl; charset=utf-8",
+      });
+      response.end(playlistContent);
       return;
     }
 
-    // 5. Проксирование вложенных M3U8
+    // 6. Проксирование вложенных M3U8
     if (url.pathname === "/proxy-m3u8") {
       const targetUrl = url.searchParams.get("url");
 
@@ -350,7 +377,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 6. Проксирование сегментов
+    // 7. Проксирование сегментов
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
 
@@ -403,14 +430,17 @@ const server = http.createServer(async (request, response) => {
       response.writeHead(segmentRes.status, resHeaders);
 
       if (segmentRes.body) {
-        Readable.fromWeb(segmentRes.body).pipe(response);
+        const stream = Readable.fromWeb(segmentRes.body);
+        stream.on("error", () => {});
+        response.on("close", () => stream.destroy());
+        stream.pipe(response);
       } else {
         response.end();
       }
       return;
     }
 
-    // 7. Запрос M3U8 плейлиста канала
+    // 8. Запрос M3U8 плейлиста конкретного канала
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
     const now = Date.now();
