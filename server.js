@@ -308,7 +308,7 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   return resolvedLines.join("\n");
 }
 
-// MediaVitrina (БЕСПРОКСИРУЮЩИЙ РЕЖИМ — прямые ссылки на CDN Витрины + Сортировка 1080p на 1 место)
+// MediaVitrina (Сортировка 1080p на 1 место + Спуфинг битрейта для прохождения лимитов ExoPlayer)
 function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
   let baseUrl;
   try {
@@ -319,7 +319,7 @@ function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
 
   const lines = m3u8Text.split(/\r?\n/);
 
-  // Если это Master M3U8 с выбором вариантов разрешения (#EXT-X-STREAM-INF)
+  // Если это Master M3U8 с несколькими качествами (#EXT-X-STREAM-INF)
   if (m3u8Text.includes("#EXT-X-STREAM-INF")) {
     const variants = [];
     const mediaTags = [];
@@ -367,8 +367,14 @@ function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
     }
 
     if (variants.length > 0) {
-      // Сортируем: наибольший битрейт (1080p) встаёт на 1 место
+      // 1. Сортируем: наибольший реальный битрейт (1080p) встаёт на 1 место
       variants.sort((a, b) => b.bandwidth - a.bandwidth);
+
+      // 2. Спуфинг: занижаем запрашиваемый битрейт 1080p до 2.5 Мбит/с,
+      // чтобы ExoPlayer сразу подхватывал его при старте даже на скорости 10 Мбит/с
+      variants[0].header = variants[0].header
+        .replace(/BANDWIDTH=\d+/, "BANDWIDTH=2500000")
+        .replace(/AVERAGE-BANDWIDTH=\d+/, "AVERAGE-BANDWIDTH=2000000");
 
       let result = "#EXTM3U\n";
       for (const tag of mediaTags) {
@@ -381,7 +387,7 @@ function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
     }
   }
 
-  // Для обычных (вложенных) плейлистов — просто превращаем относительные ссылки в абсолютные
+  // Для моно-плейлистов просто приводим пути к абсолютным
   return lines
     .map((line) => {
       const trimmed = line.trim();
