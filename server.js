@@ -308,7 +308,7 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   return resolvedLines.join("\n");
 }
 
-// MediaVitrina (Пропорциональная лесенка спуфинга битрейтов для ExoPlayer)
+// MediaVitrina (БЕСПРОКСИРУЮЩИЙ РЕЖИМ — прямые ссылки на CDN Витрины)
 function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
   let baseUrl;
   try {
@@ -317,83 +317,8 @@ function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
     return m3u8Text;
   }
 
-  const lines = m3u8Text.split(/\r?\n/);
-
-  // Если это Master M3U8 с несколькими качествами (#EXT-X-STREAM-INF)
-  if (m3u8Text.includes("#EXT-X-STREAM-INF")) {
-    const variants = [];
-    const mediaTags = [];
-    let currentHeader = null;
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (!line) continue;
-
-      if (line.startsWith("#EXT-X-MEDIA:")) {
-        const rewrittenTag = line.replace(/URI="([^"]+)"/g, (match, uri) => {
-          try {
-            return `URI="${new URL(uri, baseUrl).toString()}"`;
-          } catch {
-            return match;
-          }
-        });
-        mediaTags.push(rewrittenTag);
-      } else if (line.startsWith("#EXT-X-STREAM-INF")) {
-        currentHeader = line;
-      } else if (currentHeader && !line.startsWith("#")) {
-        let absoluteUrl = line;
-        try {
-          absoluteUrl = new URL(line, baseUrl).toString();
-        } catch {}
-
-        const bwMatch = currentHeader.match(/BANDWIDTH=(\d+)/);
-        const bandwidth = bwMatch ? parseInt(bwMatch[1], 10) : 0;
-
-        const rewrittenHeader = currentHeader.replace(/URI="([^"]+)"/g, (match, uri) => {
-          try {
-            return `URI="${new URL(uri, baseUrl).toString()}"`;
-          } catch {
-            return match;
-          }
-        });
-
-        variants.push({
-          header: rewrittenHeader,
-          url: absoluteUrl,
-          bandwidth: bandwidth,
-        });
-        currentHeader = null;
-      }
-    }
-
-    if (variants.length > 0) {
-      // 1. Сортируем: наибольший реальный битрейт (1080p) встаёт на 1 место
-      variants.sort((a, b) => b.bandwidth - a.bandwidth);
-
-      // 2. Формируем пропорциональную лесенку спуфинга:
-      // 1080p -> 3 Мбит/с, 720p -> 2 Мбит/с, 480p -> 1 Мбит/с, 360p -> 0.5 Мбит/с
-      const spoofedBitrates = [3000000, 2000000, 1000000, 500000, 250000];
-
-      variants.forEach((v, idx) => {
-        const spoofedBw = spoofedBitrates[idx] || Math.max(100000, 1000000 - idx * 100000);
-        v.header = v.header
-          .replace(/BANDWIDTH=\d+/, `BANDWIDTH=${spoofedBw}`)
-          .replace(/AVERAGE-BANDWIDTH=\d+/, `AVERAGE-BANDWIDTH=${Math.round(spoofedBw * 0.8)}`);
-      });
-
-      let result = "#EXTM3U\n";
-      for (const tag of mediaTags) {
-        result += `${tag}\n`;
-      }
-      for (const v of variants) {
-        result += `${v.header}\n${v.url}\n`;
-      }
-      return result;
-    }
-  }
-
-  // Для обычных (вложенных) плейлистов — превращаем относительные ссылки в абсолютные
-  return lines
+  return m3u8Text
+    .split(/\r?\n/)
     .map((line) => {
       const trimmed = line.trim();
       if (!trimmed) return line;
