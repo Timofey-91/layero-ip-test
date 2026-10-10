@@ -33,7 +33,7 @@ const VITRINA_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 8.0.1;)";
 const VITRINA_REFERER = "https://player.mediavitrina.ru/";
 
 let ALLOWED_DEVICES = new Set();
-let configCache = { data: null, expiresAt: 0 };
+let configCache = { data: null, fetchedAt: 0 };
 const m3u8Cache = new Map();
 
 function corsHeaders() {
@@ -126,7 +126,7 @@ async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) 
 }
 
 // ======================================================
-// DEVICE KEYS (Фоновая загрузка без блокировок)
+// DEVICE KEYS
 // ======================================================
 async function fetchAllowedDevices() {
   if (!DEVICES_CONFIG_URL) return;
@@ -151,104 +151,103 @@ async function fetchAllowedDevices() {
 }
 
 // ======================================================
-// CONFIG LOADER (Lime + Wink + Vitrina)
+// CONFIG LOADER (Сброс кэша сразу после 3:22 по Ташкенту)
 // ======================================================
-async function fetchConfig(forceRefresh = false) {
-  const now = Date.now();
-
-  if (!forceRefresh && configCache.data && now < configCache.expiresAt) {
-    return configCache.data;
+function getLatestResetTimestamp() {
+  const now = new Date();
+  // Переводим текущее время в таймзону Ташкента (UTC + 5)
+  const tashkentMs = now.getTime() + (5 * 3600 * 1000);
+  const tashkentDate = new Date(tashkentMs);
+  
+  const year = tashkentDate.getUTCFullYear();
+  const month = tashkentDate.getUTCMonth();
+  const day = tashkentDate.getUTCDate();
+  
+  // Сегодняшние 03:22 по Ташкенту в формате UTC-эпохи
+  const today322TashkentUtc = Date.UTC(year, month, day, 3, 22, 0, 0);
+  
+  let lastResetTashkentUtc;
+  if (tashkentMs >= today322TashkentUtc) {
+    // Если сейчас уже позже 3:22 — свежий апдейт был сегодня в 3:22
+    lastResetTashkentUtc = today322TashkentUtc;
+  } else {
+    // Если еще нет 3:22 — последний апдейт был вчера в 3:22
+    lastResetTashkentUtc = today322TashkentUtc - (24 * 3600 * 1000);
   }
-
-  const refreshInBackground = async () => {
-    const [limeRes, winkRes, vitrinaRes] = await Promise.allSettled([
-      fetchWithRetry(
-        LIME_CONFIG_URL,
-        {
-          headers: {
-            "Cache-Control": "no-cache, no-store",
-            "User-Agent": "Mozilla/5.0",
-            "X-LHD-Agent": LHD_AGENT,
-          },
-        },
-        2,
-        3000
-      ),
-      fetchWithRetry(
-        WINK_CONFIG_URL,
-        {
-          headers: {
-            "Cache-Control": "no-cache, no-store",
-            "User-Agent": "Mozilla/5.0",
-          },
-        },
-        2,
-        3000
-      ),
-      fetchWithRetry(
-        VITRINA_CONFIG_URL,
-        {
-          headers: {
-            "Cache-Control": "no-cache, no-store",
-            "User-Agent": VITRINA_USER_AGENT,
-          },
-        },
-        2,
-        3000
-      ),
-    ]);
-
-    let limeData = {};
-    let winkData = {};
-    let vitrinaData = {};
-
-    if (limeRes.status === "fulfilled" && limeRes.value.ok) {
-      try { limeData = await limeRes.value.json(); } catch (e) {}
-    }
-    if (winkRes.status === "fulfilled" && winkRes.value.ok) {
-      try { winkData = await winkRes.value.json(); } catch (e) {}
-    }
-    if (vitrinaRes.status === "fulfilled" && vitrinaRes.value.ok) {
-      try { vitrinaData = await vitrinaRes.value.json(); } catch (e) {}
-    }
-
-    const combinedMap = {};
-
-    // 1. Lime
-    for (const [ch, url] of Object.entries(limeData)) {
-      combinedMap[ch] = { url, provider: "lime" };
-    }
-    // 2. Wink
-    for (const [ch, url] of Object.entries(winkData)) {
-      combinedMap[ch] = { url, provider: "wink" };
-    }
-    // 3. MediaVitrina (Приоритет)
-    for (const [ch, url] of Object.entries(vitrinaData)) {
-      combinedMap[ch] = { url, provider: "vitrina" };
-    }
-
-    if (Object.keys(combinedMap).length > 0) {
-      configCache = {
-        data: { ...(configCache.data || {}), ...combinedMap },
-        expiresAt: Date.now() + 2 * 60 * 1000,
-      };
-    }
-    return configCache.data || combinedMap;
-  };
-
-  if (configCache.data && Object.keys(configCache.data).length > 0) {
-    refreshInBackground().catch(() => {});
-    return configCache.data;
-  }
-
-  return await refreshInBackground();
+  
+  // Возвращаем реальный таймстамп (отнимаем смещение +5 часов)
+  return lastResetTashkentUtc - (5 * 3600 * 1000);
 }
 
-// Автоматические интервалы обновления данных
-setInterval(() => fetchConfig(true).catch(() => {}), 4 * 60 * 1000);
-setInterval(() => fetchAllowedDevices().catch(() => {}), 5 * 60 * 1000);
+async function fetchConfig(forceRefresh = false) {
+  const lastResetTime = getLatestResetTimestamp();
 
-// Защита от накопительного роста памяти: сброс микрокэша m3u8 раз в час
+  // Если кэш есть и он был скачан ПОСЛЕ сегодняшнего (или вчерашнего) обновления в 3:22
+  if (!forceRefresh && configCache.data && configCache.fetchedAt >= lastResetTime) {
+    return configCache.data;
+  }
+
+  const [limeRes, winkRes, vitrinaRes] = await Promise.allSettled([
+    fetchWithRetry(
+      LIME_CONFIG_URL,
+      { headers: { "Cache-Control": "no-cache, no-store", "User-Agent": "Mozilla/5.0", "X-LHD-Agent": LHD_AGENT } },
+      2,
+      3000
+    ),
+    fetchWithRetry(
+      WINK_CONFIG_URL,
+      { headers: { "Cache-Control": "no-cache, no-store", "User-Agent": "Mozilla/5.0" } },
+      2,
+      3000
+    ),
+    fetchWithRetry(
+      VITRINA_CONFIG_URL,
+      { headers: { "Cache-Control": "no-cache, no-store", "User-Agent": VITRINA_USER_AGENT } },
+      2,
+      3000
+    ),
+  ]);
+
+  let limeData = {};
+  let winkData = {};
+  let vitrinaData = {};
+
+  if (limeRes.status === "fulfilled" && limeRes.value.ok) {
+    try { limeData = await limeRes.value.json(); } catch (e) {}
+  }
+  if (winkRes.status === "fulfilled" && winkRes.value.ok) {
+    try { winkData = await winkRes.value.json(); } catch (e) {}
+  }
+  if (vitrinaRes.status === "fulfilled" && vitrinaRes.value.ok) {
+    try { vitrinaData = await vitrinaRes.value.json(); } catch (e) {}
+  }
+
+  const combinedMap = {};
+
+  for (const [ch, url] of Object.entries(limeData)) {
+    combinedMap[ch] = { url, provider: "lime" };
+  }
+  for (const [ch, url] of Object.entries(winkData)) {
+    combinedMap[ch] = { url, provider: "wink" };
+  }
+  for (const [ch, url] of Object.entries(vitrinaData)) {
+    combinedMap[ch] = { url, provider: "vitrina" };
+  }
+
+  if (Object.keys(combinedMap).length > 0) {
+    configCache = {
+      data: combinedMap,
+      fetchedAt: Date.now(),
+    };
+  }
+
+  return configCache.data || combinedMap;
+}
+
+// Проверка ключей устройств раз в 10 минут
+setInterval(() => fetchAllowedDevices().catch(() => {}), 10 * 60 * 1000);
+
+// Сброс микрокэша m3u8 раз в час
 setInterval(() => {
   m3u8Cache.clear();
 }, 60 * 60 * 1000);
@@ -270,7 +269,6 @@ function isM3u8Url(urlStr) {
 // REWRITERS
 // ======================================================
 
-// Lime и Wink (Перенаправление сегментов на /proxy-segment)
 function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
@@ -308,7 +306,6 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   return resolvedLines.join("\n");
 }
 
-// MediaVitrina (БЕСПРОКСИРУЮЩИЙ РЕЖИМ — прямые ссылки на CDN Витрины)
 function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
   let baseUrl;
   try {
@@ -354,14 +351,12 @@ const server = http.createServer(async (request, response) => {
     const hostHeader = request.headers.host || "localhost";
     const url = new URL(request.url, `http://${hostHeader}`);
 
-    // 1. CORS Preflight
     if (request.method === "OPTIONS") {
       response.writeHead(204, corsHeaders());
       response.end();
       return;
     }
 
-    // 2. Robots.txt
     if (url.pathname === "/robots.txt") {
       response.writeHead(200, {
         ...corsHeaders(),
@@ -371,7 +366,6 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 3. Health Check (Корень / открыт для зеленого статуса в Layero)
     if (url.pathname === "/" || url.pathname === "") {
       response.writeHead(200, {
         ...corsHeaders(),
@@ -381,7 +375,6 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 4. Проверка ключа устройства
     const devKey = url.searchParams.get("dev");
     if (DEVICES_CONFIG_URL && ALLOWED_DEVICES.size > 0) {
       if (!devKey || !ALLOWED_DEVICES.has(devKey)) {
@@ -391,10 +384,8 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    // 5. Проксирование вложенных M3U8 (Lime/Wink)
     if (url.pathname === "/proxy-m3u8") {
       const targetUrl = url.searchParams.get("url");
-
       if (!targetUrl) {
         response.writeHead(400, corsHeaders());
         response.end();
@@ -402,10 +393,7 @@ const server = http.createServer(async (request, response) => {
       }
 
       try {
-        const subRes = await fetchWithRetry(targetUrl, {
-          headers: getHeaders(targetUrl),
-        });
-
+        const subRes = await fetchWithRetry(targetUrl, { headers: getHeaders(targetUrl) });
         if (!subRes.ok) {
           response.writeHead(subRes.status, corsHeaders());
           response.end();
@@ -428,10 +416,8 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 6. Проксирование видеосегментов (Lime/Wink)
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
-
       if (!targetUrl) {
         response.writeHead(400, corsHeaders());
         response.end();
@@ -456,7 +442,6 @@ const server = http.createServer(async (request, response) => {
       }
 
       const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
-
       if (!isOk) {
         response.writeHead(segmentRes.status || 503, corsHeaders());
         response.end();
@@ -465,8 +450,7 @@ const server = http.createServer(async (request, response) => {
 
       const resHeaders = {
         ...corsHeaders(),
-        "Content-Type":
-          segmentRes.headers.get("content-type") || "video/mp2t",
+        "Content-Type": segmentRes.headers.get("content-type") || "video/mp2t",
       };
 
       const contentLength = segmentRes.headers.get("content-length");
@@ -489,9 +473,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 7. Обработка прямых запросов каналов (например /tvc, /tvc.m3u8, /1tv, /ctc)
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
-
     const now = Date.now();
     const cachedKey = `${path}_${devKey}`;
     const cached = m3u8Cache.get(cachedKey);
@@ -527,7 +509,6 @@ const server = http.createServer(async (request, response) => {
       let processedM3u8 = "";
 
       if (channelInfo.provider === "vitrina") {
-        // Запрос к Витрине (беспроксирующий режим)
         const streamResponse = await fetchWithRetry(
           channelInfo.url,
           { headers: getVitrinaHeaders() },
@@ -542,7 +523,6 @@ const server = http.createServer(async (request, response) => {
         const rawM3u8 = await streamResponse.text();
         processedM3u8 = rewriteVitrinaPlaylist(rawM3u8, channelInfo.url);
       } else {
-        // Запрос к Lime / Wink (режим подмены заголовков)
         const streamResponse = await fetchWithRetry(channelInfo.url, {
           headers: getHeaders(channelInfo.url),
         });
