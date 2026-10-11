@@ -151,11 +151,10 @@ async function fetchAllowedDevices() {
 }
 
 // ======================================================
-// CONFIG LOADER (Сброс кэша сразу после 3:22 по Ташкенту)
+// CONFIG LOADER (Сброс кэша 2 раза в сутки: в 03:22 и 15:22 по Ташкенту)
 // ======================================================
 function getLatestResetTimestamp() {
   const now = new Date();
-  // Переводим текущее время в таймзону Ташкента (UTC + 5)
   const tashkentMs = now.getTime() + (5 * 3600 * 1000);
   const tashkentDate = new Date(tashkentMs);
   
@@ -163,26 +162,26 @@ function getLatestResetTimestamp() {
   const month = tashkentDate.getUTCMonth();
   const day = tashkentDate.getUTCDate();
   
-  // Сегодняшние 03:22 по Ташкенту в формате UTC-эпохи
-  const today322TashkentUtc = Date.UTC(year, month, day, 3, 22, 0, 0);
+  // Точки обновления за сутки по Ташкенту (03:22 и 15:22)
+  const slot1Utc = Date.UTC(year, month, day, 3, 22, 0, 0);
+  const slot2Utc = Date.UTC(year, month, day, 15, 22, 0, 0);
   
   let lastResetTashkentUtc;
-  if (tashkentMs >= today322TashkentUtc) {
-    // Если сейчас уже позже 3:22 — свежий апдейт был сегодня в 3:22
-    lastResetTashkentUtc = today322TashkentUtc;
+  if (tashkentMs >= slot2Utc) {
+    lastResetTashkentUtc = slot2Utc;
+  } else if (tashkentMs >= slot1Utc) {
+    lastResetTashkentUtc = slot1Utc;
   } else {
-    // Если еще нет 3:22 — последний апдейт был вчера в 3:22
-    lastResetTashkentUtc = today322TashkentUtc - (24 * 3600 * 1000);
+    // Если еще раньше 03:22 сегодняшнего дня — берем вечер вчерашнего дня (15:22)
+    lastResetTashkentUtc = Date.UTC(year, month, day - 1, 15, 22, 0, 0);
   }
   
-  // Возвращаем реальный таймстамп (отнимаем смещение +5 часов)
   return lastResetTashkentUtc - (5 * 3600 * 1000);
 }
 
 async function fetchConfig(forceRefresh = false) {
   const lastResetTime = getLatestResetTimestamp();
 
-  // Если кэш есть и он был скачан ПОСЛЕ сегодняшнего (или вчерашнего) обновления в 3:22
   if (!forceRefresh && configCache.data && configCache.fetchedAt >= lastResetTime) {
     return configCache.data;
   }
