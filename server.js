@@ -34,6 +34,7 @@ const VITRINA_REFERER = "https://player.mediavitrina.ru/";
 
 let ALLOWED_DEVICES = new Set();
 let configCache = { data: null, fetchedAt: 0 };
+const CONFIG_TTL = 5 * 60 * 1000; // Кэш конфига на 5 минут
 const m3u8Cache = new Map();
 
 function corsHeaders() {
@@ -100,7 +101,7 @@ function getVitrinaHeaders() {
 // ======================================================
 // FETCH WITH RETRY
 // ======================================================
-async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) {
+async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 5000) {
   let lastError;
   for (let i = 0; i < retries; i++) {
     try {
@@ -119,7 +120,7 @@ async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) 
       lastError = e;
     }
     if (i < retries - 1) {
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 1000));
     }
   }
   throw lastError || new Error(`Failed to fetch ${url}`);
@@ -151,38 +152,11 @@ async function fetchAllowedDevices() {
 }
 
 // ======================================================
-// CONFIG LOADER (Сброс кэша 2 раза в сутки: в 03:22 и 15:22 по Ташкенту)
+// CONFIG LOADER (Простой актуальный кэш на 5 минут)
 // ======================================================
-function getLatestResetTimestamp() {
-  const now = new Date();
-  const tashkentMs = now.getTime() + (5 * 3600 * 1000);
-  const tashkentDate = new Date(tashkentMs);
-  
-  const year = tashkentDate.getUTCFullYear();
-  const month = tashkentDate.getUTCMonth();
-  const day = tashkentDate.getUTCDate();
-  
-  // Точки обновления за сутки по Ташкенту (03:22 и 15:22)
-  const slot1Utc = Date.UTC(year, month, day, 3, 22, 0, 0);
-  const slot2Utc = Date.UTC(year, month, day, 15, 22, 0, 0);
-  
-  let lastResetTashkentUtc;
-  if (tashkentMs >= slot2Utc) {
-    lastResetTashkentUtc = slot2Utc;
-  } else if (tashkentMs >= slot1Utc) {
-    lastResetTashkentUtc = slot1Utc;
-  } else {
-    // Если еще раньше 03:22 сегодняшнего дня — берем вечер вчерашнего дня (15:22)
-    lastResetTashkentUtc = Date.UTC(year, month, day - 1, 15, 22, 0, 0);
-  }
-  
-  return lastResetTashkentUtc - (5 * 3600 * 1000);
-}
-
 async function fetchConfig(forceRefresh = false) {
-  const lastResetTime = getLatestResetTimestamp();
-
-  if (!forceRefresh && configCache.data && configCache.fetchedAt >= lastResetTime) {
+  const now = Date.now();
+  if (!forceRefresh && configCache.data && (now - configCache.fetchedAt < CONFIG_TTL)) {
     return configCache.data;
   }
 
@@ -190,20 +164,20 @@ async function fetchConfig(forceRefresh = false) {
     fetchWithRetry(
       LIME_CONFIG_URL,
       { headers: { "Cache-Control": "no-cache, no-store", "User-Agent": "Mozilla/5.0", "X-LHD-Agent": LHD_AGENT } },
-      2,
-      3000
+      3,
+      5000
     ),
     fetchWithRetry(
       WINK_CONFIG_URL,
       { headers: { "Cache-Control": "no-cache, no-store", "User-Agent": "Mozilla/5.0" } },
-      2,
-      3000
+      3,
+      5000
     ),
     fetchWithRetry(
       VITRINA_CONFIG_URL,
       { headers: { "Cache-Control": "no-cache, no-store", "User-Agent": VITRINA_USER_AGENT } },
-      2,
-      3000
+      3,
+      5000
     ),
   ]);
 
@@ -236,7 +210,7 @@ async function fetchConfig(forceRefresh = false) {
   if (Object.keys(combinedMap).length > 0) {
     configCache = {
       data: combinedMap,
-      fetchedAt: Date.now(),
+      fetchedAt: now,
     };
   }
 
@@ -511,8 +485,8 @@ const server = http.createServer(async (request, response) => {
         const streamResponse = await fetchWithRetry(
           channelInfo.url,
           { headers: getVitrinaHeaders() },
-          2,
-          4000
+          3,
+          5000
         );
 
         if (!streamResponse.ok) {
@@ -522,9 +496,13 @@ const server = http.createServer(async (request, response) => {
         const rawM3u8 = await streamResponse.text();
         processedM3u8 = rewriteVitrinaPlaylist(rawM3u8, channelInfo.url);
       } else {
-        const streamResponse = await fetchWithRetry(channelInfo.url, {
-          headers: getHeaders(channelInfo.url),
-        });
+        // Запрос потока Lime / Wink с надежными ретраями
+        const streamResponse = await fetchWithRetry(
+          channelInfo.url, 
+          { headers: getHeaders(channelInfo.url) },
+          3,
+          5000
+        );
 
         if (!streamResponse.ok) {
           throw new Error(`CDN status ${streamResponse.status}`);
