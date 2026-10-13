@@ -34,7 +34,6 @@ const VITRINA_REFERER = "https://player.mediavitrina.ru/";
 
 let ALLOWED_DEVICES = new Set();
 let configCache = { data: null, fetchedAt: 0 };
-const CONFIG_TTL = 5 * 60 * 1000;
 const m3u8Cache = new Map();
 
 function corsHeaders() {
@@ -98,6 +97,9 @@ function getVitrinaHeaders() {
   };
 }
 
+// ======================================================
+// FETCH WITH RETRY
+// ======================================================
 async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 5000) {
   let lastError;
   for (let i = 0; i < retries; i++) {
@@ -123,6 +125,9 @@ async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 5000) 
   throw lastError || new Error(`Failed to fetch ${url}`);
 }
 
+// ======================================================
+// DEVICE KEYS
+// ======================================================
 async function fetchAllowedDevices() {
   if (!DEVICES_CONFIG_URL) return;
 
@@ -145,9 +150,37 @@ async function fetchAllowedDevices() {
   }
 }
 
+// ======================================================
+// CONFIG LOADER (Сброс кэша 2 раза в сутки: в 03:22 и 15:22 по Ташкенту)
+// ======================================================
+function getLatestResetTimestamp() {
+  const now = new Date();
+  const tashkentMs = now.getTime() + (5 * 3600 * 1000);
+  const tashkentDate = new Date(tashkentMs);
+  
+  const year = tashkentDate.getUTCFullYear();
+  const month = tashkentDate.getUTCMonth();
+  const day = tashkentDate.getUTCDate();
+  
+  const slot1Utc = Date.UTC(year, month, day, 3, 22, 0, 0);
+  const slot2Utc = Date.UTC(year, month, day, 15, 22, 0, 0);
+  
+  let lastResetTashkentUtc;
+  if (tashkentMs >= slot2Utc) {
+    lastResetTashkentUtc = slot2Utc;
+  } else if (tashkentMs >= slot1Utc) {
+    lastResetTashkentUtc = slot1Utc;
+  } else {
+    lastResetTashkentUtc = Date.UTC(year, month, day - 1, 15, 22, 0, 0);
+  }
+  
+  return lastResetTashkentUtc - (5 * 3600 * 1000);
+}
+
 async function fetchConfig(forceRefresh = false) {
-  const now = Date.now();
-  if (!forceRefresh && configCache.data && (now - configCache.fetchedAt < CONFIG_TTL)) {
+  const lastResetTime = getLatestResetTimestamp();
+
+  if (!forceRefresh && configCache.data && configCache.fetchedAt >= lastResetTime) {
     return configCache.data;
   }
 
@@ -201,7 +234,7 @@ async function fetchConfig(forceRefresh = false) {
   if (Object.keys(combinedMap).length > 0) {
     configCache = {
       data: combinedMap,
-      fetchedAt: now,
+      fetchedAt: Date.now(),
     };
   }
 
@@ -225,6 +258,10 @@ function isM3u8Url(urlStr) {
     return urlStr.includes(".m3u8");
   }
 }
+
+// ======================================================
+// REWRITERS
+// ======================================================
 
 function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   const baseUrl = new URL(baseUrlStr);
@@ -300,6 +337,9 @@ function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
     .join("\n");
 }
 
+// ======================================================
+// SERVER
+// ======================================================
 const server = http.createServer(async (request, response) => {
   try {
     const hostHeader = request.headers.host || "localhost";
@@ -326,28 +366,6 @@ const server = http.createServer(async (request, response) => {
         "Content-Type": "text/plain; charset=utf-8",
       });
       response.end("All-in-One TV Proxy (Lime + Wink + Vitrina) is running.");
-      return;
-    }
-
-    if (url.pathname === "/test-lime") {
-      try {
-        const testUrl = "https://mhd116.iptv2022.com/x/DUaSRKXLB8BjKJJTszR6QA,1791930135/streaming/tvcplus2/324/5/tracks-v3a1/mono.ts.m3u8";
-        
-        const res = await fetch(testUrl, {
-          headers: getHeaders(testUrl)
-        });
-
-        const bodySnippet = await res.text();
-        
-        response.writeHead(200, {
-          ...corsHeaders(),
-          "Content-Type": "text/plain; charset=utf-8",
-        });
-        response.end(`TEST RESULT:\nStatus: ${res.status}\nOK: ${res.ok}\n\nSnippet:\n${bodySnippet.substring(0, 300)}`);
-      } catch (err) {
-        response.writeHead(500, corsHeaders());
-        response.end(`TEST FAILED:\nError: ${err.message}\nCause: ${err.cause || 'N/A'}`);
-      }
       return;
     }
 
