@@ -126,6 +126,32 @@ async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 5000) 
   throw lastError || new Error(`Failed to fetch ${url}`);
 }
 
+// ==========================================
+    // ВРЕМЕННЫЙ ТЕСТОВОЙ МАРШРУТ ДЛЯ ЛАЙМА
+    // ==========================================
+    if (url.pathname === "/test-lime") {
+      try {
+        // Берем тестовую ссылку, которую выдал ваш скрипт
+        const testUrl = "https://mhd116.iptv2022.com/x/DUaSRKXLB8BjKJJTszR6QA,1791930135/streaming/tvcplus2/324/5/tracks-v3a1/mono.ts.m3u8";
+        
+        const res = await fetch(testUrl, {
+          headers: getHeaders(testUrl)
+        });
+
+        const bodySnippet = await res.text();
+        
+        response.writeHead(200, {
+          ...corsHeaders(),
+          "Content-Type": "text/plain; charset=utf-8",
+        });
+        response.end(`TEST RESULT:\nStatus: ${res.status}\nOK: ${res.ok}\n\nSnippet:\n${bodySnippet.substring(0, 300)}`);
+      } catch (err) {
+        response.writeHead(500, corsHeaders());
+        response.end(`TEST FAILED:\nError: ${err.message}\nCause: ${err.cause || 'N/A'}`);
+      }
+      return;
+    }
+
 // ======================================================
 // DEVICE KEYS
 // ======================================================
