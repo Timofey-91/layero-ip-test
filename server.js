@@ -126,32 +126,6 @@ async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 5000) 
   throw lastError || new Error(`Failed to fetch ${url}`);
 }
 
-// ==========================================
-    // ВРЕМЕННЫЙ ТЕСТОВОЙ МАРШРУТ ДЛЯ ЛАЙМА
-    // ==========================================
-    if (url.pathname === "/test-lime") {
-      try {
-        // Берем тестовую ссылку, которую выдал ваш скрипт
-        const testUrl = "https://mhd116.iptv2022.com/x/DUaSRKXLB8BjKJJTszR6QA,1791930135/streaming/tvcplus2/324/5/tracks-v3a1/mono.ts.m3u8";
-        
-        const res = await fetch(testUrl, {
-          headers: getHeaders(testUrl)
-        });
-
-        const bodySnippet = await res.text();
-        
-        response.writeHead(200, {
-          ...corsHeaders(),
-          "Content-Type": "text/plain; charset=utf-8",
-        });
-        response.end(`TEST RESULT:\nStatus: ${res.status}\nOK: ${res.ok}\n\nSnippet:\n${bodySnippet.substring(0, 300)}`);
-      } catch (err) {
-        response.writeHead(500, corsHeaders());
-        response.end(`TEST FAILED:\nError: ${err.message}\nCause: ${err.cause || 'N/A'}`);
-      }
-      return;
-    }
-
 // ======================================================
 // DEVICE KEYS
 // ======================================================
@@ -178,7 +152,7 @@ async function fetchAllowedDevices() {
 }
 
 // ======================================================
-// CONFIG LOADER (Простой актуальный кэш на 5 минут)
+// CONFIG LOADER
 // ======================================================
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
@@ -243,10 +217,7 @@ async function fetchConfig(forceRefresh = false) {
   return configCache.data || combinedMap;
 }
 
-// Проверка ключей устройств раз в 10 минут
 setInterval(() => fetchAllowedDevices().catch(() => {}), 10 * 60 * 1000);
-
-// Сброс микрокэша m3u8 раз в час
 setInterval(() => {
   m3u8Cache.clear();
 }, 60 * 60 * 1000);
@@ -374,6 +345,31 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    // ==========================================
+    // ВРЕМЕННЫЙ ТЕСТОВОЙ МАРШРУТ ДЛЯ ЛАЙМА
+    // ==========================================
+    if (url.pathname === "/test-lime") {
+      try {
+        const testUrl = "https://mhd116.iptv2022.com/x/DUaSRKXLB8BjKJJTszR6QA,1791930135/streaming/tvcplus2/324/5/tracks-v3a1/mono.ts.m3u8";
+        
+        const res = await fetch(testUrl, {
+          headers: getHeaders(testUrl)
+        });
+
+        const bodySnippet = await res.text();
+        
+        response.writeHead(200, {
+          ...corsHeaders(),
+          "Content-Type": "text/plain; charset=utf-8",
+        });
+        response.end(`TEST RESULT:\nStatus: ${res.status}\nOK: ${res.ok}\n\nSnippet:\n${bodySnippet.substring(0, 300)}`);
+      } catch (err) {
+        response.writeHead(500, corsHeaders(), { "Content-Type": "text/plain; charset=utf-8" });
+        response.end(`TEST FAILED:\nError: ${err.message}\nCause: ${err.cause || 'N/A'}`);
+      }
+      return;
+    }
+
     const devKey = url.searchParams.get("dev");
     if (DEVICES_CONFIG_URL && ALLOWED_DEVICES.size > 0) {
       if (!devKey || !ALLOWED_DEVICES.has(devKey)) {
@@ -404,174 +400,4 @@ const server = http.createServer(async (request, response) => {
 
         response.writeHead(200, {
           ...corsHeaders(),
-          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-        });
-        response.end(processedM3u8);
-      } catch (e) {
-        console.error("Error proxying m3u8:", e.message);
-        response.writeHead(503, corsHeaders());
-        response.end();
-      }
-      return;
-    }
-
-    if (url.pathname === "/proxy-segment") {
-      const targetUrl = url.searchParams.get("url");
-      if (!targetUrl) {
-        response.writeHead(400, corsHeaders());
-        response.end();
-        return;
-      }
-
-      const isWink = isWinkUrl(targetUrl);
-      const reqHeaders = getHeaders(targetUrl);
-
-      if (isWink && request.headers["range"]) {
-        reqHeaders["Range"] = request.headers["range"];
-      }
-
-      let segmentRes;
-      try {
-        segmentRes = await fetchWithRetry(targetUrl, { headers: reqHeaders });
-      } catch (e) {
-        console.error("Error proxying segment:", e.message);
-        response.writeHead(503, corsHeaders());
-        response.end();
-        return;
-      }
-
-      const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
-      if (!isOk) {
-        response.writeHead(segmentRes.status || 503, corsHeaders());
-        response.end();
-        return;
-      }
-
-      const resHeaders = {
-        ...corsHeaders(),
-        "Content-Type": segmentRes.headers.get("content-type") || "video/mp2t",
-      };
-
-      const contentLength = segmentRes.headers.get("content-length");
-      if (contentLength) resHeaders["Content-Length"] = contentLength;
-
-      if (isWink && segmentRes.headers.get("content-range")) {
-        resHeaders["Content-Range"] = segmentRes.headers.get("content-range");
-      }
-
-      response.writeHead(segmentRes.status, resHeaders);
-
-      if (segmentRes.body) {
-        const stream = Readable.fromWeb(segmentRes.body);
-        stream.on("error", () => {});
-        response.on("close", () => stream.destroy());
-        stream.pipe(response);
-      } else {
-        response.end();
-      }
-      return;
-    }
-
-    const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
-    const now = Date.now();
-    const cachedKey = `${path}_${devKey}`;
-    const cached = m3u8Cache.get(cachedKey);
-
-    if (cached && now < cached.expiresAt) {
-      response.writeHead(200, {
-        ...corsHeaders(),
-        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-      });
-      response.end(cached.content);
-      return;
-    }
-
-    try {
-      const config = await fetchConfig();
-      const channelInfo = config[path];
-
-      if (!channelInfo || !channelInfo.url) {
-        if (cached && cached.content) {
-          response.writeHead(200, {
-            ...corsHeaders(),
-            "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-          });
-          response.end(cached.content);
-          return;
-        }
-
-        response.writeHead(503, corsHeaders());
-        response.end();
-        return;
-      }
-
-      let processedM3u8 = "";
-
-      if (channelInfo.provider === "vitrina") {
-        const streamResponse = await fetchWithRetry(
-          channelInfo.url,
-          { headers: getVitrinaHeaders() },
-          3,
-          5000
-        );
-
-        if (!streamResponse.ok) {
-          throw new Error(`Vitrina status ${streamResponse.status}`);
-        }
-
-        const rawM3u8 = await streamResponse.text();
-        processedM3u8 = rewriteVitrinaPlaylist(rawM3u8, channelInfo.url);
-      } else {
-        // Запрос потока Lime / Wink с надежными ретраями
-        const streamResponse = await fetchWithRetry(
-          channelInfo.url, 
-          { headers: getHeaders(channelInfo.url) },
-          3,
-          5000
-        );
-
-        if (!streamResponse.ok) {
-          throw new Error(`CDN status ${streamResponse.status}`);
-        }
-
-        const rawM3u8 = await streamResponse.text();
-        processedM3u8 = resolveM3u8Urls(rawM3u8, channelInfo.url, devKey);
-      }
-
-      m3u8Cache.set(cachedKey, {
-        content: processedM3u8,
-        expiresAt: now + 1000,
-      });
-
-      response.writeHead(200, {
-        ...corsHeaders(),
-        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-      });
-      response.end(processedM3u8);
-    } catch (error) {
-      console.error(`Error fetching M3U8 for ${path}:`, error.message);
-
-      if (cached && cached.content) {
-        response.writeHead(200, {
-          ...corsHeaders(),
-          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-        });
-        response.end(cached.content);
-        return;
-      }
-
-      response.writeHead(503, corsHeaders());
-      response.end();
-    }
-  } catch (error) {
-    console.error("Unhandled Server Error:", error);
-    response.writeHead(500, corsHeaders());
-    response.end();
-  }
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`All-in-One Proxy listening on port ${PORT}`);
-  fetchConfig().catch(() => {});
-  fetchAllowedDevices().catch(() => {});
-});
+          "
