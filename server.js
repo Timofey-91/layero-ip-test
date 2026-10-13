@@ -34,7 +34,7 @@ const VITRINA_REFERER = "https://player.mediavitrina.ru/";
 
 let ALLOWED_DEVICES = new Set();
 let configCache = { data: null, fetchedAt: 0 };
-const CONFIG_TTL = 5 * 60 * 1000; // Кэш конфига на 5 минут
+const CONFIG_TTL = 5 * 60 * 1000;
 const m3u8Cache = new Map();
 
 function corsHeaders() {
@@ -98,9 +98,6 @@ function getVitrinaHeaders() {
   };
 }
 
-// ======================================================
-// FETCH WITH RETRY
-// ======================================================
 async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 5000) {
   let lastError;
   for (let i = 0; i < retries; i++) {
@@ -126,9 +123,6 @@ async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 5000) 
   throw lastError || new Error(`Failed to fetch ${url}`);
 }
 
-// ======================================================
-// DEVICE KEYS
-// ======================================================
 async function fetchAllowedDevices() {
   if (!DEVICES_CONFIG_URL) return;
 
@@ -151,9 +145,6 @@ async function fetchAllowedDevices() {
   }
 }
 
-// ======================================================
-// CONFIG LOADER
-// ======================================================
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
   if (!forceRefresh && configCache.data && (now - configCache.fetchedAt < CONFIG_TTL)) {
@@ -235,10 +226,6 @@ function isM3u8Url(urlStr) {
   }
 }
 
-// ======================================================
-// REWRITERS
-// ======================================================
-
 function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
@@ -313,9 +300,6 @@ function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
     .join("\n");
 }
 
-// ======================================================
-// SERVER
-// ======================================================
 const server = http.createServer(async (request, response) => {
   try {
     const hostHeader = request.headers.host || "localhost";
@@ -345,9 +329,6 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // ==========================================
-    // ВРЕМЕННЫЙ ТЕСТОВОЙ МАРШРУТ ДЛЯ ЛАЙМА
-    // ==========================================
     if (url.pathname === "/test-lime") {
       try {
         const testUrl = "https://mhd116.iptv2022.com/x/DUaSRKXLB8BjKJJTszR6QA,1791930135/streaming/tvcplus2/324/5/tracks-v3a1/mono.ts.m3u8";
@@ -364,7 +345,7 @@ const server = http.createServer(async (request, response) => {
         });
         response.end(`TEST RESULT:\nStatus: ${res.status}\nOK: ${res.ok}\n\nSnippet:\n${bodySnippet.substring(0, 300)}`);
       } catch (err) {
-        response.writeHead(500, corsHeaders(), { "Content-Type": "text/plain; charset=utf-8" });
+        response.writeHead(500, corsHeaders());
         response.end(`TEST FAILED:\nError: ${err.message}\nCause: ${err.cause || 'N/A'}`);
       }
       return;
@@ -400,4 +381,173 @@ const server = http.createServer(async (request, response) => {
 
         response.writeHead(200, {
           ...corsHeaders(),
-          "
+          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        });
+        response.end(processedM3u8);
+      } catch (e) {
+        console.error("Error proxying m3u8:", e.message);
+        response.writeHead(503, corsHeaders());
+        response.end();
+      }
+      return;
+    }
+
+    if (url.pathname === "/proxy-segment") {
+      const targetUrl = url.searchParams.get("url");
+      if (!targetUrl) {
+        response.writeHead(400, corsHeaders());
+        response.end();
+        return;
+      }
+
+      const isWink = isWinkUrl(targetUrl);
+      const reqHeaders = getHeaders(targetUrl);
+
+      if (isWink && request.headers["range"]) {
+        reqHeaders["Range"] = request.headers["range"];
+      }
+
+      let segmentRes;
+      try {
+        segmentRes = await fetchWithRetry(targetUrl, { headers: reqHeaders });
+      } catch (e) {
+        console.error("Error proxying segment:", e.message);
+        response.writeHead(503, corsHeaders());
+        response.end();
+        return;
+      }
+
+      const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
+      if (!isOk) {
+        response.writeHead(segmentRes.status || 503, corsHeaders());
+        response.end();
+        return;
+      }
+
+      const resHeaders = {
+        ...corsHeaders(),
+        "Content-Type": segmentRes.headers.get("content-type") || "video/mp2t",
+      };
+
+      const contentLength = segmentRes.headers.get("content-length");
+      if (contentLength) resHeaders["Content-Length"] = contentLength;
+
+      if (isWink && segmentRes.headers.get("content-range")) {
+        resHeaders["Content-Range"] = segmentRes.headers.get("content-range");
+      }
+
+      response.writeHead(segmentRes.status, resHeaders);
+
+      if (segmentRes.body) {
+        const stream = Readable.fromWeb(segmentRes.body);
+        stream.on("error", () => {});
+        response.on("close", () => stream.destroy());
+        stream.pipe(response);
+      } else {
+        response.end();
+      }
+      return;
+    }
+
+    const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
+    const now = Date.now();
+    const cachedKey = `${path}_${devKey}`;
+    const cached = m3u8Cache.get(cachedKey);
+
+    if (cached && now < cached.expiresAt) {
+      response.writeHead(200, {
+        ...corsHeaders(),
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+      });
+      response.end(cached.content);
+      return;
+    }
+
+    try {
+      const config = await fetchConfig();
+      const channelInfo = config[path];
+
+      if (!channelInfo || !channelInfo.url) {
+        if (cached && cached.content) {
+          response.writeHead(200, {
+            ...corsHeaders(),
+            "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+          });
+          response.end(cached.content);
+          return;
+        }
+
+        response.writeHead(503, corsHeaders());
+        response.end();
+        return;
+      }
+
+      let processedM3u8 = "";
+
+      if (channelInfo.provider === "vitrina") {
+        const streamResponse = await fetchWithRetry(
+          channelInfo.url,
+          { headers: getVitrinaHeaders() },
+          3,
+          5000
+        );
+
+        if (!streamResponse.ok) {
+          throw new Error(`Vitrina status ${streamResponse.status}`);
+        }
+
+        const rawM3u8 = await streamResponse.text();
+        processedM3u8 = rewriteVitrinaPlaylist(rawM3u8, channelInfo.url);
+      } else {
+        const streamResponse = await fetchWithRetry(
+          channelInfo.url, 
+          { headers: getHeaders(channelInfo.url) },
+          3,
+          5000
+        );
+
+        if (!streamResponse.ok) {
+          throw new Error(`CDN status ${streamResponse.status}`);
+        }
+
+        const rawM3u8 = await streamResponse.text();
+        processedM3u8 = resolveM3u8Urls(rawM3u8, channelInfo.url, devKey);
+      }
+
+      m3u8Cache.set(cachedKey, {
+        content: processedM3u8,
+        expiresAt: now + 1000,
+      });
+
+      response.writeHead(200, {
+        ...corsHeaders(),
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+      });
+      response.end(processedM3u8);
+    } catch (error) {
+      console.error(`Error fetching M3U8 for ${path}:`, error.message);
+
+      if (cached && cached.content) {
+        response.writeHead(200, {
+          ...corsHeaders(),
+          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        });
+        response.end(cached.content);
+        return;
+      }
+
+      response.writeHead(503, corsHeaders());
+      response.end();
+    }
+  } catch (error) {
+    console.error("Unhandled Server Error:", error);
+    response.writeHead(500, corsHeaders());
+    response.end();
+  }
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`All-in-One Proxy listening on port ${PORT}`);
+  fetchConfig().catch(() => {});
+  fetchAllowedDevices().catch(() => {});
+});
