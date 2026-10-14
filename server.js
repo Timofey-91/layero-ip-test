@@ -21,14 +21,12 @@ const VITRINA_CONFIG_URL =
 // HEADERS & AGENTS
 // ======================================================
 const LHD_AGENT = JSON.stringify({
-  platform: "android",
-  app: "limehd.ru.ctvshka",
-  version_name: "5.0.8",
-  version_code: "430",
-  sdk: "34",
-  name: "Xiaomi 13 Ultra",
-  device_id: "a7f8e9d1c2b3a4f5",
-  is_huawei: "0",
+  version_name: "1.0.2.203",
+  version_code: "203",
+  platform: "win",
+  device_id: "00000000",
+  app: "tv.limehd.win",
+  generation: "2",
 });
 
 const VITRINA_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 8.0.1;)";
@@ -81,12 +79,12 @@ function getHeaders(targetUrl) {
 
   return {
     ...baseHeaders,
-    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 14; Xiaomi 13 Ultra Build/UP1A.231005.007)",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "X-LHD-Agent": LHD_AGENT,
     "Referer": "https://limehd.tv/",
     "Origin": "https://limehd.tv",
     "Accept": "*/*",
-    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     "Connection": "keep-alive",
   };
 }
@@ -189,7 +187,7 @@ async function fetchConfig(forceRefresh = false) {
   const [limeRes, winkRes, vitrinaRes] = await Promise.allSettled([
     fetchWithRetry(
       LIME_CONFIG_URL,
-      { headers: { "Cache-Control": "no-cache, no-store", "User-Agent": "Dalvik/2.1.0", "X-LHD-Agent": LHD_AGENT } },
+      { headers: { "Cache-Control": "no-cache, no-store", "User-Agent": "Mozilla/5.0", "X-LHD-Agent": LHD_AGENT } },
       3,
       5000
     ),
