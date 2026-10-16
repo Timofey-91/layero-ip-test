@@ -1,6 +1,10 @@
 import http from "node:http";
 import { URL } from "node:url";
 import { Readable } from "node:stream";
+import dns from "node:dns";
+
+// КРИТИЧНО для доступа к российским API с зарубежных/облачных IP
+dns.setDefaultResultOrder("ipv4first");
 
 const PORT = process.env.PORT || 8000;
 const DEVICES_CONFIG_URL = process.env.DEVICES_CONFIG_URL;
@@ -34,6 +38,7 @@ const VITRINA_REFERER = "https://player.mediavitrina.ru/";
 
 let ALLOWED_DEVICES = new Set();
 let configCache = { data: null, fetchedAt: 0 };
+let LIME_DYNAMIC = {}; // { tvc_plus2: "https://...", ... } — свежие ссылки из API Lime
 const m3u8Cache = new Map();
 
 function corsHeaders() {
@@ -221,12 +226,19 @@ async function fetchConfig(forceRefresh = false) {
 
   const combinedMap = {};
 
+  // 1. Статические Lime-ссылки из config.json на GitVerse
   for (const [ch, url] of Object.entries(limeData)) {
     combinedMap[ch] = { url, provider: "lime" };
   }
+  // 2. Динамические Lime-ссылки (перекрывают статические — они свежее)
+  for (const [ch, url] of Object.entries(LIME_DYNAMIC)) {
+    combinedMap[ch] = { url, provider: "lime" };
+  }
+  // 3. Wink
   for (const [ch, url] of Object.entries(winkData)) {
     combinedMap[ch] = { url, provider: "wink" };
   }
+  // 4. Vitrina (высший приоритет)
   for (const [ch, url] of Object.entries(vitrinaData)) {
     combinedMap[ch] = { url, provider: "vitrina" };
   }
@@ -338,6 +350,125 @@ function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
 }
 
 // ======================================================
+// LIMEHD — АВТООБНОВЛЕНИЕ ССЫЛОК (порт Python-скрипта)
+// ======================================================
+const LIME_API_TIMEOUT = 20000;
+
+const LIME_TARGET_CHANNELS = [
+  { key: "tvc_plus2", id: 129, region: 66, tz: 5 },
+  { key: "tvc_plus4", id: 129, region: 54, tz: 7 },
+  { key: "tvc_plus6", id: 129, region: 25, tz: 10 },
+];
+
+async function limeFetch(url, options = {}, timeoutMs = LIME_API_TIMEOUT) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal, redirect: "follow" });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function limeFindMasterUrl(obj) {
+  if (!obj) return null;
+  if (typeof obj === "string") {
+    return (obj.startsWith("http") && obj.includes("index.m3u8")) ? obj : null;
+  }
+  if (Array.isArray(obj)) {
+    for (const it of obj) { const f = limeFindMasterUrl(it); if (f) return f; }
+  } else if (typeof obj === "object") {
+    for (const v of Object.values(obj)) { const f = limeFindMasterUrl(v); if (f) return f; }
+  }
+  return null;
+}
+
+async function limeGetMaster(chId, region, tz) {
+  const apiUrl = `https://pl.iptv2021.com/api/v4/channel?id=${chId}&tz=${tz}&region=${region}`;
+  const res = await limeFetch(apiUrl, { headers: getHeaders(apiUrl) });
+  if (!res.ok) throw new Error(`API HTTP ${res.status}`);
+  const data = await res.json();
+  const master = limeFindMasterUrl(data);
+  if (!master) throw new Error("Master URL не найден в ответе API");
+  return master;
+}
+
+async function limeGetMasterPlaylist(masterUrl) {
+  const res = await limeFetch(masterUrl, { headers: getHeaders(masterUrl) });
+  if (!res.ok) throw new Error(`Master HTTP ${res.status}`);
+  return { finalUrl: res.url, text: await res.text() };
+}
+
+function limeParseVideoStreams(masterUrl, playlist) {
+  const lines = playlist.split(/\r?\n/);
+  const streams = [];
+  let currentInf = null;
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    if (t.startsWith("#EXT-X-STREAM-INF:")) { currentInf = t; continue; }
+    if (currentInf && !t.startsWith("#")) {
+      const resM = currentInf.match(/RESOLUTION=(\d+x\d+)/);
+      const bwM = currentInf.match(/BANDWIDTH=(\d+)/);
+      streams.push({
+        resolution: resM ? resM[1] : "",
+        bandwidth: bwM ? parseInt(bwM[1], 10) : 0,
+        url: new URL(t, masterUrl).toString(),
+      });
+      currentInf = null;
+    }
+  }
+  if (!streams.length) throw new Error("Нет VIDEO-потоков в master");
+  return streams;
+}
+
+function limeChooseStream(streams) {
+  const sorted = [...streams].sort((a, b) => b.bandwidth - a.bandwidth);
+  // Берём 3-й сверху (обычно 480p) — как в Python-скрипте
+  return sorted.length >= 3 ? sorted[2] : sorted[sorted.length - 1];
+}
+
+async function limeVerifyPlaylist(stream) {
+  const res = await limeFetch(stream.url, { headers: getHeaders(stream.url) });
+  if (!res.ok) throw new Error(`Playlist HTTP ${res.status}`);
+  const text = await res.text();
+  if (!text.includes("#EXTM3U")) throw new Error("Не HLS playlist");
+  const segs = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith("#"));
+  if (!segs.length) throw new Error("Нет TS-сегментов");
+
+  for (const seg of segs.slice(-3).reverse()) {
+    try {
+      const segUrl = new URL(seg, res.url).toString();
+      const r = await limeFetch(segUrl, { headers: getHeaders(segUrl) }, 10000);
+      if (!r.ok) continue;
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length >= 4 && buf[0] === 0x47) return res.url;
+    } catch { /* next */ }
+  }
+  throw new Error("TS-сегменты не проверились");
+}
+
+async function refreshLimeLinks() {
+  console.log("[Lime] Обновление ссылок...");
+  const result = {};
+  for (const ch of LIME_TARGET_CHANNELS) {
+    try {
+      const master = await limeGetMaster(ch.id, ch.region, ch.tz);
+      const { finalUrl, text } = await limeGetMasterPlaylist(master);
+      const streams = limeParseVideoStreams(finalUrl, text);
+      const selected = limeChooseStream(streams);
+      const finalUrl2 = await limeVerifyPlaylist(selected);
+      result[ch.key] = finalUrl2;
+      console.log(`[Lime] ✅ ${ch.key}: ${selected.resolution}`);
+    } catch (e) {
+      console.error(`[Lime] ❌ ${ch.key}: ${e.message}${e.cause ? ` | ${e.cause.code || e.cause.message}` : ""}`);
+    }
+  }
+  if (Object.keys(result).length) LIME_DYNAMIC = result;
+  return result;
+}
+
+// ======================================================
 // SERVER
 // ======================================================
 const server = http.createServer(async (request, response) => {
@@ -357,6 +488,30 @@ const server = http.createServer(async (request, response) => {
         "Content-Type": "text/plain; charset=utf-8",
       });
       response.end("User-agent: *\nDisallow: /");
+      return;
+    }
+
+    // 🔥 ВРЕМЕННЫЙ ТЕСТОВЫЙ ЭНДПОИНТ — проверьте его ДО всего остального!
+    // Открыть: https://ваш-домен.layero.app/test-lime-api
+    if (url.pathname === "/test-lime-api") {
+      try {
+        const r = await fetch("https://pl.iptv2021.com/api/v4/channel?id=129&tz=5&region=66", {
+          headers: getHeaders("https://pl.iptv2021.com"),
+          signal: AbortSignal.timeout(15000),
+        });
+        const txt = await r.text();
+        response.writeHead(200, { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8" });
+        response.end(`STATUS: ${r.status}\n\n${txt.slice(0, 2000)}`);
+      } catch (e) {
+        response.writeHead(200, { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8" });
+        response.end(`ERROR: ${e.message}\nCause: ${e.cause?.code || e.cause?.message || "n/a"}`);
+      }
+      return;
+    }
+
+    if (url.pathname === "/test-lime-status") {
+      response.writeHead(200, { ...corsHeaders(), "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ dynamic: LIME_DYNAMIC }, null, 2));
       return;
     }
 
@@ -568,4 +723,8 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`All-in-One Proxy listening on port ${PORT}`);
   fetchConfig().catch(() => {});
   fetchAllowedDevices().catch(() => {});
+
+  // Запускаем обновление Lime-ссылок сразу и каждые 20 минут
+  refreshLimeLinks().catch(console.error);
+  setInterval(() => refreshLimeLinks().catch(console.error), 20 * 60 * 1000);
 });
