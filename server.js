@@ -19,12 +19,12 @@ const WINK_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/mediavitrina-proxy/raw/branch/master/wink.json";
 
 const LHD_AGENT = JSON.stringify({
-  version_name: "1.0.2.203",
-  version_code: "203",
-  platform: "win",
+  version_name: "1.0.24.155",
+  version_code: "155",
+  platform: "web",
   device_id: "448182.66555409547-1790167864304",
-  app: "tv.limehd.win",
-  generation: "2",
+  app: "limehd.tv",
+  generation: "1",
 });
 
 let configCache = { data: null, expiresAt: 0 };
@@ -74,7 +74,7 @@ function getHeaders(targetUrl) {
 
   return {
     ...baseHeaders,
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "User-Agent": "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
     "X-LHD-Agent": LHD_AGENT,
     "Referer": "https://limehd.tv/",
     "Origin": "https://limehd.tv",
