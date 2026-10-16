@@ -20,8 +20,8 @@ jobs:
       - name: 1. Будим репозиторий Витрины (mediavitrina-proxy)
         run: |
           git remote add gitverse-v https://oauth2:${{ secrets.GITVERSETOKEN }}@gitverse.ru/Timofey91/mediavitrina-proxy.git
-          git fetch gitverse-v master || true
-          git checkout master || git checkout -b master
+          git fetch gitverse-v master
+          git checkout -B master gitverse-v/master
           git commit --allow-empty -m "Keep-alive ping mediavitrina"
           git push gitverse-v master
           git remote remove gitverse-v
@@ -30,8 +30,8 @@ jobs:
         run: |
           git checkout -- .
           git remote add gitverse-p https://oauth2:${{ secrets.GITVERSETOKEN }}@gitverse.ru/Timofey91/peer_test.git
-          git fetch gitverse-p master || true
-          git checkout master || git checkout -b master
+          git fetch gitverse-p master
+          git checkout -B master gitverse-p/master
           git commit --allow-empty -m "Keep-alive ping peer_test"
           git push gitverse-p master
           git remote remove gitverse-p
