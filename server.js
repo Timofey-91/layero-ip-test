@@ -10,13 +10,16 @@ const DEVICES_CONFIG_URL = process.env.DEVICES_CONFIG_URL;
 // Множество разрешенных ключей устройств
 let ALLOWED_DEVICES = new Set();
 
-// Конфиг LimeHD
-const LIME_CONFIG_URL =
-  "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
-
-// Конфиг Wink
+// Конфиг Wink (оставляем без изменений)
 const WINK_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/mediavitrina-proxy/raw/branch/master/wink.json";
+
+// Параметры Lime каналов для авто-генерации свежих ссылок на лету
+const LIME_CHANNELS = {
+  "tvc_plus2": { id: 129, region: 66, tz: 5 },
+  "tvc_plus4": { id: 129, region: 54, tz: 7 },
+  "tvc_plus6": { id: 129, region: 25, tz: 10 },
+};
 
 const LHD_AGENT = JSON.stringify({
   version_name: "1.0.24.155",
@@ -27,7 +30,7 @@ const LHD_AGENT = JSON.stringify({
   generation: "1",
 });
 
-let configCache = { data: null, expiresAt: 0 };
+let winkConfigCache = { data: null, expiresAt: 0 };
 const m3u8Cache = new Map();
 
 function corsHeaders() {
@@ -112,7 +115,6 @@ async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) 
 // Подгрузка списка разрешенных ключей устройств из Secret Gist
 async function fetchAllowedDevices() {
   if (!DEVICES_CONFIG_URL) {
-    console.warn("[Devices] Переменная DEVICES_CONFIG_URL не задана в Layero, проверка ключей отключена.");
     return;
   }
 
@@ -128,85 +130,40 @@ async function fetchAllowedDevices() {
       const devicesArray = await res.json();
       if (Array.isArray(devicesArray)) {
         ALLOWED_DEVICES = new Set(devicesArray.map((d) => String(d).trim()));
-        console.log(`[Devices] Загружено разрешенных ключей: ${ALLOWED_DEVICES.size}`);
       }
     }
-  } catch (e) {
-    console.error("[Devices] Ошибка загрузки списка устройств из Gist:", e.message);
-  }
+  } catch (e) {}
 }
 
-async function fetchConfig(forceRefresh = false) {
+// Загрузка конфига Wink
+async function fetchWinkConfig(forceRefresh = false) {
   const now = Date.now();
-
-  if (!forceRefresh && configCache.data && now < configCache.expiresAt) {
-    return configCache.data;
+  if (!forceRefresh && winkConfigCache.data && now < winkConfigCache.expiresAt) {
+    return winkConfigCache.data;
   }
 
-  const refreshInBackground = async () => {
-    const [limeRes, winkRes] = await Promise.allSettled([
-      fetchWithRetry(
-        LIME_CONFIG_URL,
-        {
-          headers: {
-            "Cache-Control": "no-cache, no-store",
-            "User-Agent": "Mozilla/5.0",
-            "X-LHD-Agent": LHD_AGENT,
-          },
-        },
-        2,
-        3000
-      ),
-      fetchWithRetry(
-        WINK_CONFIG_URL,
-        {
-          headers: {
-            "Cache-Control": "no-cache, no-store",
-            "User-Agent": "Mozilla/5.0",
-          },
-        },
-        2,
-        3000
-      ),
-    ]);
-
-    let limeData = {};
-    let winkData = {};
-
-    if (limeRes.status === "fulfilled" && limeRes.value.ok) {
-      try {
-        limeData = await limeRes.value.json();
-      } catch (e) {}
-    }
-
-    if (winkRes.status === "fulfilled" && winkRes.value.ok) {
-      try {
-        winkData = await winkRes.value.json();
-      } catch (e) {}
-    }
-
-    const combinedData = { ...winkData, ...limeData };
-
-    if (Object.keys(combinedData).length > 0) {
-      configCache = {
-        data: { ...(configCache.data || {}), ...combinedData },
-        expiresAt: Date.now() + 60 * 1000,
+  try {
+    const res = await fetchWithRetry(
+      WINK_CONFIG_URL,
+      { headers: { "Cache-Control": "no-cache, no-store", "User-Agent": "Mozilla/5.0" } },
+      2,
+      3000
+    );
+    if (res.ok) {
+      const data = await res.json();
+      winkConfigCache = {
+        data,
+        expiresAt: Date.now() + 5 * 60 * 1000,
       };
+      return data;
     }
-    return configCache.data || combinedData;
-  };
-
-  if (configCache.data && Object.keys(configCache.data).length > 0) {
-    refreshInBackground().catch(() => {});
-    return configCache.data;
-  }
-
-  return await refreshInBackground();
+  } catch (e) {}
+  return winkConfigCache.data || {};
 }
 
-// Обновление конфигов каналов раз в 4 минуты
+// Обновление конфигов Wink раз в 4 минуты
 setInterval(() => {
-  fetchConfig(true).catch(() => {});
+  fetchWinkConfig(true).catch(() => {});
 }, 4 * 60 * 1000);
 
 // Авто-обновление ключей устройств из Secret Gist каждые 5 минут
@@ -227,8 +184,8 @@ function isM3u8Url(urlStr) {
   }
 }
 
-// Приписывает параметр &dev=key к переписанным ссылкам на сегменты и плейлисты
-function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
+// Превращаем относительные пути сегментов в абсолютные прямые URL на CDN (чтобы плеер качал напрямую)
+function resolveAbsoluteUrls(m3u8Text, baseUrlStr, devKey = "") {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
   const devParam = devKey ? `&dev=${encodeURIComponent(devKey)}` : "";
@@ -241,10 +198,11 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
       return line.replace(/URI=["']([^"']+)["']/g, (match, relativeUri) => {
         try {
           const absoluteUri = new URL(relativeUri, baseUrl).toString();
-          const endpoint = isM3u8Url(absoluteUri)
-            ? "/proxy-m3u8"
-            : "/proxy-segment";
-          return `URI="${endpoint}?url=${encodeURIComponent(absoluteUri)}${devParam}"`;
+          if (isWinkUrl(absoluteUri)) {
+            const endpoint = isM3u8Url(absoluteUri) ? "/proxy-m3u8" : "/proxy-segment";
+            return `URI="${endpoint}?url=${encodeURIComponent(absoluteUri)}${devParam}"`;
+          }
+          return `URI="${absoluteUri}"`;
         } catch {
           return match;
         }
@@ -253,10 +211,12 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
 
     try {
       const absoluteUri = new URL(trimmed, baseUrl).toString();
-      const endpoint = isM3u8Url(absoluteUri)
-        ? "/proxy-m3u8"
-        : "/proxy-segment";
-      return `${endpoint}?url=${encodeURIComponent(absoluteUri)}${devParam}`;
+      // Для Wink оставляем проксирование через Layero, для Lime — отдаем прямую абсолютную ссылку на CDNVideo
+      if (isWinkUrl(absoluteUri)) {
+        const endpoint = isM3u8Url(absoluteUri) ? "/proxy-m3u8" : "/proxy-segment";
+        return `${endpoint}?url=${encodeURIComponent(absoluteUri)}${devParam}`;
+      }
+      return absoluteUri;
     } catch {
       return line;
     }
@@ -265,14 +225,66 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   return resolvedLines.join("\n");
 }
 
-// Генерация M3U плейлиста со всеми доступными каналами
-function generatePlaylist(config, host, devKey = "") {
+// Помощник для извлечения мастер-ссылки из Lime API
+function extractMasterUrl(obj) {
+  let found = null;
+  function search(target) {
+    if (found) return;
+    if (typeof target === "string" && target.startsWith("http") && target.includes("index.m3u8")) {
+      found = target;
+      return;
+    }
+    if (typeof target === "object" && target !== null) {
+      for (const val of Object.values(target)) search(val);
+    }
+  }
+  search(obj);
+  return found;
+}
+
+// Выбор потока 480p (или ближайшего доступного)
+function selectStreamUrl(masterM3u8Text, masterBaseUrl) {
+  const lines = masterM3u8Text.split(/\r?\n/);
+  const streams = [];
+  let currentInf = null;
+
+  for (let line of lines) {
+    line = line.trim();
+    if (line.startsWith("#EXT-X-STREAM-INF:")) {
+      currentInf = line;
+      continue;
+    }
+    if (currentInf && line && !line.startsWith("#")) {
+      const bwMatch = currentInf.match(/BANDWIDTH=(\d+)/);
+      const bw = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+      streams.push({ bandwidth: bw, url: new URL(line, masterBaseUrl).toString() });
+      currentInf = null;
+    }
+  }
+
+  if (streams.length === 0) return masterBaseUrl;
+  streams.sort((a, b) => b.bandwidth - a.bandwidth);
+  return streams.length >= 3 ? streams[2].url : streams[streams.length - 1].url;
+}
+
+// Генерация общего M3U плейлиста
+async function generatePlaylist(host, devKey = "") {
+  const winkConfig = await fetchWinkConfig();
   const lines = ["#EXTM3U"];
   const devParam = devKey ? `?dev=${encodeURIComponent(devKey)}` : "";
 
-  for (const channelId of Object.keys(config)) {
+  // Добавляем Lime каналы
+  for (const channelId of Object.keys(LIME_CHANNELS)) {
     lines.push(`#EXTINF:-1 tvg-id="${channelId}" tvg-name="${channelId}",${channelId}`);
     lines.push(`http://${host}/${channelId}.m3u8${devParam}`);
+  }
+
+  // Добавляем Wink каналы
+  for (const channelId of Object.keys(winkConfig)) {
+    if (!LIME_CHANNELS[channelId]) {
+      lines.push(`#EXTINF:-1 tvg-id="${channelId}" tvg-name="${channelId}",${channelId}`);
+      lines.push(`http://${host}/${channelId}.m3u8${devParam}`);
+    }
   }
 
   return lines.join("\n");
@@ -281,10 +293,7 @@ function generatePlaylist(config, host, devKey = "") {
 const server = http.createServer(async (request, response) => {
   try {
     const hostHeader = request.headers.host || "localhost";
-    const url = new URL(
-      request.url,
-      `http://${hostHeader}`
-    );
+    const url = new URL(request.url, `http://${hostHeader}`);
 
     // 1. CORS Preflight
     if (request.method === "OPTIONS") {
@@ -303,7 +312,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 3. Корень / - Пинг для Health Check от Layero (без проверки ключей)
+    // 3. Корень / - Пинг
     if (url.pathname === "/" || url.pathname === "") {
       response.writeHead(200, {
         ...corsHeaders(),
@@ -313,7 +322,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 4. Проверка ключа устройства (выполняется, только если переменная Gist задана)
+    // 4. Проверка ключа устройства
     const devKey = url.searchParams.get("dev");
     if (DEVICES_CONFIG_URL && ALLOWED_DEVICES.size > 0) {
       if (!devKey || !ALLOWED_DEVICES.has(devKey)) {
@@ -323,15 +332,13 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    // 5. Выгрузка M3U плейлиста для IPTV-плееров (/playlist.m3u, /playlist.m3u8, /m3u)
+    // 5. Выгрузка M3U плейлиста
     if (
       url.pathname === "/playlist.m3u" ||
       url.pathname === "/playlist.m3u8" ||
       url.pathname === "/m3u"
     ) {
-      const config = await fetchConfig();
-      const playlistContent = generatePlaylist(config, hostHeader, devKey);
-
+      const playlistContent = await generatePlaylist(hostHeader, devKey);
       response.writeHead(200, {
         ...corsHeaders(),
         "Content-Type": "application/x-mpegurl; charset=utf-8",
@@ -340,10 +347,9 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 6. Проксирование вложенных M3U8
+    // 6. Проксирование вложенных M3U8 (для Wink)
     if (url.pathname === "/proxy-m3u8") {
       const targetUrl = url.searchParams.get("url");
-
       if (!targetUrl) {
         response.writeHead(400, corsHeaders());
         response.end();
@@ -362,7 +368,7 @@ const server = http.createServer(async (request, response) => {
         }
 
         const rawM3u8 = await subRes.text();
-        const processedM3u8 = resolveM3u8Urls(rawM3u8, targetUrl, devKey);
+        const processedM3u8 = resolveAbsoluteUrls(rawM3u8, targetUrl, devKey);
 
         response.writeHead(200, {
           ...corsHeaders(),
@@ -370,17 +376,15 @@ const server = http.createServer(async (request, response) => {
         });
         response.end(processedM3u8);
       } catch (e) {
-        console.error("Error proxying m3u8:", e.message);
         response.writeHead(503, corsHeaders());
         response.end();
       }
       return;
     }
 
-    // 7. Проксирование сегментов
+    // 7. Проксирование сегментов (для Wink)
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
-
       if (!targetUrl) {
         response.writeHead(400, corsHeaders());
         response.end();
@@ -398,14 +402,12 @@ const server = http.createServer(async (request, response) => {
       try {
         segmentRes = await fetchWithRetry(targetUrl, { headers: reqHeaders });
       } catch (e) {
-        console.error("Error proxying segment:", e.message);
         response.writeHead(503, corsHeaders());
         response.end();
         return;
       }
 
       const isOk = segmentRes.ok || (isWink && segmentRes.status === 206);
-
       if (!isOk) {
         response.writeHead(segmentRes.status || 503, corsHeaders());
         response.end();
@@ -414,14 +416,11 @@ const server = http.createServer(async (request, response) => {
 
       const resHeaders = {
         ...corsHeaders(),
-        "Content-Type":
-          segmentRes.headers.get("content-type") || "video/mp2t",
+        "Content-Type": segmentRes.headers.get("content-type") || "video/mp2t",
       };
 
       const contentLength = segmentRes.headers.get("content-length");
-      if (contentLength) {
-        resHeaders["Content-Length"] = contentLength;
-      }
+      if (contentLength) resHeaders["Content-Length"] = contentLength;
 
       if (isWink && segmentRes.headers.get("content-range")) {
         resHeaders["Content-Range"] = segmentRes.headers.get("content-range");
@@ -442,9 +441,8 @@ const server = http.createServer(async (request, response) => {
 
     // 8. Запрос M3U8 плейлиста конкретного канала
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
-
     const now = Date.now();
-    const cachedKey = `${path}_${devKey}`;
+    const cachedKey = `${path}_${devKey || ""}`;
     const cached = m3u8Cache.get(cachedKey);
 
     if (cached && now < cached.expiresAt) {
@@ -456,53 +454,91 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    try {
-      const config = await fetchConfig();
-      const streamUrl = config[path];
+    let processedM3u8 = "";
 
-      if (!streamUrl) {
-        if (cached && cached.content) {
-          response.writeHead(200, {
-            ...corsHeaders(),
-            "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-          });
-          response.end(cached.content);
+    try {
+      // Если это Lime канал — генерируем свежую ссылку на лету с заголовками Lime
+      if (LIME_CHANNELS[path]) {
+        const ch = LIME_CHANNELS[path];
+        const apiUrl = `https://pl.iptv2021.com/api/v4/channel?id=${ch.id}&tz=${ch.tz}&region=${ch.region}`;
+        
+        const apiRes = await fetchWithRetry(apiUrl, { headers: getHeaders(apiUrl) }, 2, 3500);
+        if (!apiRes.ok) throw new Error(`Lime API status ${apiRes.status}`);
+        
+        const apiData = await apiRes.json();
+        const masterUrl = extractMasterUrl(apiData);
+        if (!masterUrl) throw new Error("Master URL not found");
+
+        const masterRes = await fetchWithRetry(masterUrl, { headers: getHeaders(masterUrl) }, 2, 3500);
+        if (!masterRes.ok) throw new Error(`Master playlist status ${masterRes.status}`);
+
+        const finalMasterUrl = masterRes.url || masterUrl;
+        const masterText = await masterRes.text();
+        const selectedStreamUrl = selectStreamUrl(masterText, finalMasterUrl);
+
+        const streamRes = await fetchWithRetry(selectedStreamUrl, { headers: getHeaders(selectedStreamUrl) }, 2, 3500);
+        if (!streamRes.ok) throw new Error(`Stream playlist status ${streamRes.status}`);
+
+        const finalStreamUrl = streamRes.url || selectedStreamUrl;
+        const rawM3u8 = await streamRes.text();
+
+        processedM3u8 = resolveAbsoluteUrls(rawM3u8, finalStreamUrl, devKey);
+
+        // Кэшируем плейлист на 50 минут (токены CDNVideo живут долго)
+        m3u8Cache.set(cachedKey, {
+          content: processedM3u8,
+          expiresAt: now + 50 * 60 * 1000,
+        });
+
+      } else {
+        // Обычные каналы (Wink и другие из конфига)
+        const winkConfig = await fetchWinkConfig();
+        const streamUrl = winkConfig[path];
+
+        if (!streamUrl) {
+          if (cached && cached.content) {
+            response.writeHead(200, {
+              ...corsHeaders(),
+              "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+            });
+            response.end(cached.content);
+            return;
+          }
+          response.writeHead(503, corsHeaders());
+          response.end();
           return;
         }
 
-        response.writeHead(503, corsHeaders());
-        response.end();
-        return;
+        const streamResponse = await fetchWithRetry(streamUrl, {
+          headers: getHeaders(streamUrl),
+        });
+
+        if (!streamResponse.ok) {
+          throw new Error(`Wink CDN status ${streamResponse.status}`);
+        }
+
+        const rawM3u8 = await streamResponse.text();
+        processedM3u8 = resolveAbsoluteUrls(rawM3u8, streamUrl, devKey);
+
+        m3u8Cache.set(cachedKey, {
+          content: processedM3u8,
+          expiresAt: now + 2 * 60 * 1000, // Кэш для Wink на 2 минуты
+        });
       }
-
-      const streamResponse = await fetchWithRetry(streamUrl, {
-        headers: getHeaders(streamUrl),
-      });
-
-      if (!streamResponse.ok) {
-        throw new Error(`CDN status ${streamResponse.status}`);
-      }
-
-      const rawM3u8 = await streamResponse.text();
-      const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl, devKey);
-
-      m3u8Cache.set(cachedKey, {
-        content: processedM3u8,
-        expiresAt: now + 1000,
-      });
 
       response.writeHead(200, {
         ...corsHeaders(),
         "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
       });
       response.end(processedM3u8);
+
     } catch (error) {
       console.error(`Error fetching M3U8 for ${path}:`, error.message);
 
       if (cached && cached.content) {
         response.writeHead(200, {
           ...corsHeaders(),
-          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+          "Content-Type": "application/vnd.apple.mpegurl; channels=1; charset=utf-8",
         });
         response.end(cached.content);
         return;
@@ -519,7 +555,7 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Lime & Wink Proxy listening on port ${PORT}`);
-  fetchConfig().catch(() => {});
+  console.log(`Proxy listening on port ${PORT}`);
+  fetchWinkConfig().catch(() => {});
   fetchAllowedDevices().catch(() => {});
 });
