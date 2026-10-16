@@ -543,8 +543,8 @@ const server = http.createServer(async (request, response) => {
       });
       response.end(processedM3u8);
     } catch (error) {
-      console.error(`Error fetching M3U8 for ${path}:`, error.message);
-
+      console.error(`Error fetching M3U8 for ${path}:`, error.message, error.cause ? `| Cause: ${error.cause.message || error.cause.code}` : '');
+      
       if (cached && cached.content) {
         response.writeHead(200, {
           ...corsHeaders(),
