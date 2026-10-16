@@ -3,10 +3,10 @@ import { URL } from "node:url";
 import { Readable } from "node:stream";
 import dns from "node:dns";
 
-// КРИТИЧНО для доступа к российским API с зарубежных/облачных IP
+// КРИТИЧНО: принудительно IPv4, чтобы не ловить ETIMEDOUT на IPv6 к российским CDN
 dns.setDefaultResultOrder("ipv4first");
 
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 3000;
 const DEVICES_CONFIG_URL = process.env.DEVICES_CONFIG_URL;
 
 // ======================================================
@@ -14,10 +14,8 @@ const DEVICES_CONFIG_URL = process.env.DEVICES_CONFIG_URL;
 // ======================================================
 const LIME_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
-
 const WINK_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/mediavitrina-proxy/raw/branch/master/wink.json";
-
 const VITRINA_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/mediavitrina-proxy/raw/branch/master/config.json";
 
@@ -36,9 +34,12 @@ const LHD_AGENT = JSON.stringify({
 const VITRINA_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 8.0.1;)";
 const VITRINA_REFERER = "https://player.mediavitrina.ru/";
 
+const CHROME_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 let ALLOWED_DEVICES = new Set();
 let configCache = { data: null, fetchedAt: 0 };
-let LIME_DYNAMIC = {}; // { tvc_plus2: "https://...", ... } — свежие ссылки из API Lime
+let LIME_DYNAMIC = {};
 const m3u8Cache = new Map();
 
 function corsHeaders() {
@@ -59,38 +60,32 @@ function isWinkUrl(targetUrl) {
     u.includes("rt.ru") ||
     u.includes("ngenix") ||
     u.includes("cdntv") ||
-    u.includes("zabava")
+    u.includes("zabava") ||
+    u.includes("mediavitrina")
   );
 }
 
+// ВНИМАНИЕ: Origin/Referer для Lime ОСТАВЛЕНЫ —
+// без них CDN отдаёт баннер вместо видеопотока (anti-leech).
+// НЕ добавляем Connection: keep-alive — он ломает HTTP/2 апгрейд.
+// НЕ добавляем Cache-Control/Pragma/Expires — они бесполезны для стрима.
 function getHeaders(targetUrl) {
-  const baseHeaders = {
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    "Pragma": "no-cache",
-    "Expires": "0",
-  };
-
   if (isWinkUrl(targetUrl)) {
     return {
-      ...baseHeaders,
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "User-Agent": CHROME_UA,
       "Referer": "https://wink.ru/",
       "Origin": "https://wink.ru",
       "Accept": "*/*",
-      "Connection": "keep-alive",
     };
   }
 
   return {
-    ...baseHeaders,
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": CHROME_UA,
     "X-LHD-Agent": LHD_AGENT,
     "Referer": "https://limehd.tv/",
     "Origin": "https://limehd.tv",
     "Accept": "*/*",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Connection": "keep-alive",
   };
 }
 
@@ -103,9 +98,9 @@ function getVitrinaHeaders() {
 }
 
 // ======================================================
-// FETCH WITH RETRY
+// FETCH WITH RETRY (backoff 2s → 4s → 8s, обработка сетевых ошибок)
 // ======================================================
-async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 5000) {
+async function fetchWithRetry(url, options = {}, retries = 4, timeoutMs = 20000) {
   let lastError;
   for (let i = 0; i < retries; i++) {
     try {
@@ -115,6 +110,7 @@ async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 5000) 
       const res = await fetch(url, {
         ...options,
         signal: controller.signal,
+        redirect: "follow",
       });
       clearTimeout(timer);
 
@@ -122,6 +118,20 @@ async function fetchWithRetry(url, options = {}, retries = 3, timeoutMs = 5000) 
       lastError = new Error(`HTTP status ${res.status}`);
     } catch (e) {
       lastError = e;
+      const code = e.cause?.code;
+      // При сетевых ошибках делаем паузу — CDN успеет переключить edge-ноду
+      if (
+        code === "ETIMEDOUT" ||
+        code === "ENOTFOUND" ||
+        code === "EAI_AGAIN" ||
+        code === "ECONNRESET" ||
+        code === "ECONNREFUSED"
+      ) {
+        if (i < retries - 1) {
+          await new Promise((r) => setTimeout(r, 1500 + i * 1500));
+        }
+        continue;
+      }
     }
     if (i < retries - 1) {
       await new Promise((r) => setTimeout(r, 1000));
@@ -141,35 +151,36 @@ async function fetchAllowedDevices() {
       DEVICES_CONFIG_URL,
       { headers: { "Cache-Control": "no-cache, no-store" } },
       2,
-      3000
+      5000
     );
 
     if (res.ok) {
       const devicesArray = await res.json();
       if (Array.isArray(devicesArray)) {
         ALLOWED_DEVICES = new Set(devicesArray.map((d) => String(d).trim()));
+        console.log(`[Devices] Загружено ключей: ${ALLOWED_DEVICES.size}`);
       }
     }
   } catch (e) {
-    console.error("[Devices] Ошибка загрузки ключей из Gist:", e.message);
+    console.error("[Devices] Ошибка загрузки ключей:", e.message);
   }
 }
 
 // ======================================================
-// CONFIG LOADER (Сброс кэша 2 раза в сутки: в 03:22 и 15:22 по Ташкенту)
+// CONFIG LOADER
 // ======================================================
 function getLatestResetTimestamp() {
   const now = new Date();
-  const tashkentMs = now.getTime() + (5 * 3600 * 1000);
+  const tashkentMs = now.getTime() + 5 * 3600 * 1000;
   const tashkentDate = new Date(tashkentMs);
-  
+
   const year = tashkentDate.getUTCFullYear();
   const month = tashkentDate.getUTCMonth();
   const day = tashkentDate.getUTCDate();
-  
+
   const slot1Utc = Date.UTC(year, month, day, 3, 22, 0, 0);
   const slot2Utc = Date.UTC(year, month, day, 15, 22, 0, 0);
-  
+
   let lastResetTashkentUtc;
   if (tashkentMs >= slot2Utc) {
     lastResetTashkentUtc = slot2Utc;
@@ -178,8 +189,8 @@ function getLatestResetTimestamp() {
   } else {
     lastResetTashkentUtc = Date.UTC(year, month, day - 1, 15, 22, 0, 0);
   }
-  
-  return lastResetTashkentUtc - (5 * 3600 * 1000);
+
+  return lastResetTashkentUtc - 5 * 3600 * 1000;
 }
 
 async function fetchConfig(forceRefresh = false) {
@@ -226,11 +237,11 @@ async function fetchConfig(forceRefresh = false) {
 
   const combinedMap = {};
 
-  // 1. Статические Lime-ссылки из config.json на GitVerse
+  // 1. Статические Lime из config.json
   for (const [ch, url] of Object.entries(limeData)) {
     combinedMap[ch] = { url, provider: "lime" };
   }
-  // 2. Динамические Lime-ссылки (перекрывают статические — они свежее)
+  // 2. Динамические Lime (перекрывают статические — свежее)
   for (const [ch, url] of Object.entries(LIME_DYNAMIC)) {
     combinedMap[ch] = { url, provider: "lime" };
   }
@@ -244,19 +255,14 @@ async function fetchConfig(forceRefresh = false) {
   }
 
   if (Object.keys(combinedMap).length > 0) {
-    configCache = {
-      data: combinedMap,
-      fetchedAt: Date.now(),
-    };
+    configCache = { data: combinedMap, fetchedAt: Date.now() };
   }
 
   return configCache.data || combinedMap;
 }
 
 setInterval(() => fetchAllowedDevices().catch(() => {}), 10 * 60 * 1000);
-setInterval(() => {
-  m3u8Cache.clear();
-}, 60 * 60 * 1000);
+setInterval(() => { m3u8Cache.clear(); }, 60 * 60 * 1000);
 
 function isM3u8Url(urlStr) {
   try {
@@ -274,7 +280,6 @@ function isM3u8Url(urlStr) {
 // ======================================================
 // REWRITERS
 // ======================================================
-
 function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
@@ -288,9 +293,7 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
       return line.replace(/URI=["']([^"']+)["']/g, (match, relativeUri) => {
         try {
           const absoluteUri = new URL(relativeUri, baseUrl).toString();
-          const endpoint = isM3u8Url(absoluteUri)
-            ? "/proxy-m3u8"
-            : "/proxy-segment";
+          const endpoint = isM3u8Url(absoluteUri) ? "/proxy-m3u8" : "/proxy-segment";
           return `URI="${endpoint}?url=${encodeURIComponent(absoluteUri)}${devParam}"`;
         } catch {
           return match;
@@ -300,9 +303,7 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
 
     try {
       const absoluteUri = new URL(trimmed, baseUrl).toString();
-      const endpoint = isM3u8Url(absoluteUri)
-        ? "/proxy-m3u8"
-        : "/proxy-segment";
+      const endpoint = isM3u8Url(absoluteUri) ? "/proxy-m3u8" : "/proxy-segment";
       return `${endpoint}?url=${encodeURIComponent(absoluteUri)}${devParam}`;
     } catch {
       return line;
@@ -314,11 +315,7 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
 
 function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
   let baseUrl;
-  try {
-    baseUrl = new URL(targetUrl);
-  } catch {
-    return m3u8Text;
-  }
+  try { baseUrl = new URL(targetUrl); } catch { return m3u8Text; }
 
   return m3u8Text
     .split(/\r?\n/)
@@ -328,22 +325,12 @@ function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
 
       if (trimmed.startsWith("#") && trimmed.includes('URI="')) {
         return line.replace(/URI="([^"]+)"/g, (match, uri) => {
-          try {
-            return `URI="${new URL(uri, baseUrl).toString()}"`;
-          } catch {
-            return match;
-          }
+          try { return `URI="${new URL(uri, baseUrl).toString()}"`; } catch { return match; }
         });
       }
-
       if (!trimmed.startsWith("#")) {
-        try {
-          return new URL(trimmed, baseUrl).toString();
-        } catch {
-          return line;
-        }
+        try { return new URL(trimmed, baseUrl).toString(); } catch { return line; }
       }
-
       return line;
     })
     .join("\n");
@@ -352,28 +339,16 @@ function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
 // ======================================================
 // LIMEHD — АВТООБНОВЛЕНИЕ ССЫЛОК (порт Python-скрипта)
 // ======================================================
-const LIME_API_TIMEOUT = 20000;
-
 const LIME_TARGET_CHANNELS = [
   { key: "tvc_plus2", id: 129, region: 66, tz: 5 },
   { key: "tvc_plus4", id: 129, region: 54, tz: 7 },
   { key: "tvc_plus6", id: 129, region: 25, tz: 10 },
 ];
 
-async function limeFetch(url, options = {}, timeoutMs = LIME_API_TIMEOUT) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal, redirect: "follow" });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 function limeFindMasterUrl(obj) {
   if (!obj) return null;
   if (typeof obj === "string") {
-    return (obj.startsWith("http") && obj.includes("index.m3u8")) ? obj : null;
+    return obj.startsWith("http") && obj.includes("index.m3u8") ? obj : null;
   }
   if (Array.isArray(obj)) {
     for (const it of obj) { const f = limeFindMasterUrl(it); if (f) return f; }
@@ -385,16 +360,16 @@ function limeFindMasterUrl(obj) {
 
 async function limeGetMaster(chId, region, tz) {
   const apiUrl = `https://pl.iptv2021.com/api/v4/channel?id=${chId}&tz=${tz}&region=${region}`;
-  const res = await limeFetch(apiUrl, { headers: getHeaders(apiUrl) });
+  const res = await fetchWithRetry(apiUrl, { headers: getHeaders(apiUrl) }, 4, 20000);
   if (!res.ok) throw new Error(`API HTTP ${res.status}`);
   const data = await res.json();
   const master = limeFindMasterUrl(data);
-  if (!master) throw new Error("Master URL не найден в ответе API");
+  if (!master) throw new Error("Master URL не найден");
   return master;
 }
 
 async function limeGetMasterPlaylist(masterUrl) {
-  const res = await limeFetch(masterUrl, { headers: getHeaders(masterUrl) });
+  const res = await fetchWithRetry(masterUrl, { headers: getHeaders(masterUrl) }, 4, 20000);
   if (!res.ok) throw new Error(`Master HTTP ${res.status}`);
   return { finalUrl: res.url, text: await res.text() };
 }
@@ -418,40 +393,33 @@ function limeParseVideoStreams(masterUrl, playlist) {
       currentInf = null;
     }
   }
-  if (!streams.length) throw new Error("Нет VIDEO-потоков в master");
+  if (!streams.length) throw new Error("Нет VIDEO-потоков");
   return streams;
 }
 
 function limeChooseStream(streams) {
   const sorted = [...streams].sort((a, b) => b.bandwidth - a.bandwidth);
-  // Берём 3-й сверху (обычно 480p) — как в Python-скрипте
+  // 3-й сверху (обычно 480p), как в Python
   return sorted.length >= 3 ? sorted[2] : sorted[sorted.length - 1];
 }
 
+// Верификация без скачивания TS — токен живёт 24 часа, этого достаточно
 async function limeVerifyPlaylist(stream) {
-  const res = await limeFetch(stream.url, { headers: getHeaders(stream.url) });
+  const res = await fetchWithRetry(stream.url, { headers: getHeaders(stream.url) }, 4, 20000);
   if (!res.ok) throw new Error(`Playlist HTTP ${res.status}`);
   const text = await res.text();
   if (!text.includes("#EXTM3U")) throw new Error("Не HLS playlist");
-  const segs = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith("#"));
-  if (!segs.length) throw new Error("Нет TS-сегментов");
-
-  for (const seg of segs.slice(-3).reverse()) {
-    try {
-      const segUrl = new URL(seg, res.url).toString();
-      const r = await limeFetch(segUrl, { headers: getHeaders(segUrl) }, 10000);
-      if (!r.ok) continue;
-      const buf = Buffer.from(await r.arrayBuffer());
-      if (buf.length >= 4 && buf[0] === 0x47) return res.url;
-    } catch { /* next */ }
-  }
-  throw new Error("TS-сегменты не проверились");
+  const segs = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+  if (!segs.length) throw new Error("Нет сегментов в плейлисте");
+  // ВАЖНО: возвращаем ОРИГИНАЛЬНЫЙ stream.url — CDN сам выберет edge-ноду
+  return stream.url;
 }
 
 async function refreshLimeLinks() {
   console.log("[Lime] Обновление ссылок...");
   const result = {};
   for (const ch of LIME_TARGET_CHANNELS) {
+    const t0 = Date.now();
     try {
       const master = await limeGetMaster(ch.id, ch.region, ch.tz);
       const { finalUrl, text } = await limeGetMasterPlaylist(master);
@@ -459,9 +427,15 @@ async function refreshLimeLinks() {
       const selected = limeChooseStream(streams);
       const finalUrl2 = await limeVerifyPlaylist(selected);
       result[ch.key] = finalUrl2;
-      console.log(`[Lime] ✅ ${ch.key}: ${selected.resolution}`);
+      console.log(`[Lime] ✅ ${ch.key}: ${selected.resolution} (${Date.now() - t0}ms)`);
     } catch (e) {
-      console.error(`[Lime] ❌ ${ch.key}: ${e.message}${e.cause ? ` | ${e.cause.code || e.cause.message}` : ""}`);
+      let host = "?";
+      try { host = new URL(e.url || "").host; } catch {}
+      console.error(
+        `[Lime] ❌ ${ch.key}: ${e.message}` +
+        (e.cause ? ` | Cause: ${e.cause.code || e.cause.message}` : "") +
+        ` | Host: ${host} (${Date.now() - t0}ms)`
+      );
     }
   }
   if (Object.keys(result).length) LIME_DYNAMIC = result;
@@ -483,22 +457,20 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (url.pathname === "/robots.txt") {
-      response.writeHead(200, {
-        ...corsHeaders(),
-        "Content-Type": "text/plain; charset=utf-8",
-      });
+      response.writeHead(200, { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8" });
       response.end("User-agent: *\nDisallow: /");
       return;
     }
 
-    // 🔥 ВРЕМЕННЫЙ ТЕСТОВЫЙ ЭНДПОИНТ — проверьте его ДО всего остального!
-    // Открыть: https://ваш-домен.layero.app/test-lime-api
+    // 🔬 ДИАГНОСТИКА
     if (url.pathname === "/test-lime-api") {
       try {
-        const r = await fetch("https://pl.iptv2021.com/api/v4/channel?id=129&tz=5&region=66", {
-          headers: getHeaders("https://pl.iptv2021.com"),
-          signal: AbortSignal.timeout(15000),
-        });
+        const r = await fetchWithRetry(
+          "https://pl.iptv2021.com/api/v4/channel?id=129&tz=5&region=66",
+          { headers: getHeaders("https://pl.iptv2021.com") },
+          2,
+          15000
+        );
         const txt = await r.text();
         response.writeHead(200, { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8" });
         response.end(`STATUS: ${r.status}\n\n${txt.slice(0, 2000)}`);
@@ -515,11 +487,15 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    if (url.pathname === "/test-lime-refresh") {
+      const fresh = await refreshLimeLinks();
+      response.writeHead(200, { ...corsHeaders(), "Content-Type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ refreshed: fresh }, null, 2));
+      return;
+    }
+
     if (url.pathname === "/" || url.pathname === "") {
-      response.writeHead(200, {
-        ...corsHeaders(),
-        "Content-Type": "text/plain; charset=utf-8",
-      });
+      response.writeHead(200, { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8" });
       response.end("All-in-One TV Proxy (Lime + Wink + Vitrina) is running.");
       return;
     }
@@ -535,14 +511,10 @@ const server = http.createServer(async (request, response) => {
 
     if (url.pathname === "/proxy-m3u8") {
       const targetUrl = url.searchParams.get("url");
-      if (!targetUrl) {
-        response.writeHead(400, corsHeaders());
-        response.end();
-        return;
-      }
+      if (!targetUrl) { response.writeHead(400, corsHeaders()); response.end(); return; }
 
       try {
-        const subRes = await fetchWithRetry(targetUrl, { headers: getHeaders(targetUrl) });
+        const subRes = await fetchWithRetry(targetUrl, { headers: getHeaders(targetUrl) }, 3, 15000);
         if (!subRes.ok) {
           response.writeHead(subRes.status, corsHeaders());
           response.end();
@@ -552,13 +524,10 @@ const server = http.createServer(async (request, response) => {
         const rawM3u8 = await subRes.text();
         const processedM3u8 = resolveM3u8Urls(rawM3u8, targetUrl, devKey);
 
-        response.writeHead(200, {
-          ...corsHeaders(),
-          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-        });
+        response.writeHead(200, { ...corsHeaders(), "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8" });
         response.end(processedM3u8);
       } catch (e) {
-        console.error("Error proxying m3u8:", e.message);
+        console.error("Error proxying m3u8:", e.message, e.cause?.code || "");
         response.writeHead(503, corsHeaders());
         response.end();
       }
@@ -567,11 +536,7 @@ const server = http.createServer(async (request, response) => {
 
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
-      if (!targetUrl) {
-        response.writeHead(400, corsHeaders());
-        response.end();
-        return;
-      }
+      if (!targetUrl) { response.writeHead(400, corsHeaders()); response.end(); return; }
 
       const isWink = isWinkUrl(targetUrl);
       const reqHeaders = getHeaders(targetUrl);
@@ -582,9 +547,9 @@ const server = http.createServer(async (request, response) => {
 
       let segmentRes;
       try {
-        segmentRes = await fetchWithRetry(targetUrl, { headers: reqHeaders });
+        segmentRes = await fetchWithRetry(targetUrl, { headers: reqHeaders }, 3, 20000);
       } catch (e) {
-        console.error("Error proxying segment:", e.message);
+        console.error("Error proxying segment:", e.message, e.cause?.code || "");
         response.writeHead(503, corsHeaders());
         response.end();
         return;
@@ -601,10 +566,8 @@ const server = http.createServer(async (request, response) => {
         ...corsHeaders(),
         "Content-Type": segmentRes.headers.get("content-type") || "video/mp2t",
       };
-
       const contentLength = segmentRes.headers.get("content-length");
       if (contentLength) resHeaders["Content-Length"] = contentLength;
-
       if (isWink && segmentRes.headers.get("content-range")) {
         resHeaders["Content-Range"] = segmentRes.headers.get("content-range");
       }
@@ -622,34 +585,29 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    // Обработка канала
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
     const now = Date.now();
     const cachedKey = `${path}_${devKey}`;
     const cached = m3u8Cache.get(cachedKey);
 
     if (cached && now < cached.expiresAt) {
-      response.writeHead(200, {
-        ...corsHeaders(),
-        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-      });
+      response.writeHead(200, { ...corsHeaders(), "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8" });
       response.end(cached.content);
       return;
     }
 
+    let channelInfo = null;
     try {
       const config = await fetchConfig();
-      const channelInfo = config[path];
+      channelInfo = config[path];
 
       if (!channelInfo || !channelInfo.url) {
         if (cached && cached.content) {
-          response.writeHead(200, {
-            ...corsHeaders(),
-            "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-          });
+          response.writeHead(200, { ...corsHeaders(), "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8" });
           response.end(cached.content);
           return;
         }
-
         response.writeHead(503, corsHeaders());
         response.end();
         return;
@@ -658,53 +616,65 @@ const server = http.createServer(async (request, response) => {
       let processedM3u8 = "";
 
       if (channelInfo.provider === "vitrina") {
-        const streamResponse = await fetchWithRetry(
-          channelInfo.url,
-          { headers: getVitrinaHeaders() },
-          3,
-          5000
-        );
-
-        if (!streamResponse.ok) {
-          throw new Error(`Vitrina status ${streamResponse.status}`);
-        }
-
+        const streamResponse = await fetchWithRetry(channelInfo.url, { headers: getVitrinaHeaders() }, 3, 15000);
+        if (!streamResponse.ok) throw new Error(`Vitrina status ${streamResponse.status}`);
         const rawM3u8 = await streamResponse.text();
         processedM3u8 = rewriteVitrinaPlaylist(rawM3u8, channelInfo.url);
       } else {
         const streamResponse = await fetchWithRetry(
-          channelInfo.url, 
+          channelInfo.url,
           { headers: getHeaders(channelInfo.url) },
-          3,
-          5000
+          4,
+          20000
         );
-
-        if (!streamResponse.ok) {
-          throw new Error(`CDN status ${streamResponse.status}`);
-        }
-
+        if (!streamResponse.ok) throw new Error(`CDN status ${streamResponse.status}`);
         const rawM3u8 = await streamResponse.text();
         processedM3u8 = resolveM3u8Urls(rawM3u8, channelInfo.url, devKey);
       }
 
-      m3u8Cache.set(cachedKey, {
-        content: processedM3u8,
-        expiresAt: now + 1000,
-      });
+      m3u8Cache.set(cachedKey, { content: processedM3u8, expiresAt: now + 2000 });
 
-      response.writeHead(200, {
-        ...corsHeaders(),
-        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-      });
+      response.writeHead(200, { ...corsHeaders(), "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8" });
       response.end(processedM3u8);
     } catch (error) {
-      console.error(`Error fetching M3U8 for ${path}:`, error.message, error.cause ? `| Cause: ${error.cause.message || error.cause.code}` : '');
-      
+      let host = "?";
+      try { host = new URL(error.url || "").host; } catch {}
+      console.error(
+        `Error fetching M3U8 for ${path}: ${error.message}` +
+        (error.cause ? ` | Cause: ${error.cause.code || error.cause.message}` : "") +
+        ` | Host: ${host}`
+      );
+
+      // 🚑 АВТОВОССТАНОВЛЕНИЕ ДЛЯ LIME
+      const isLimeChannel =
+        path.startsWith("tvc_plus") ||
+        (channelInfo && channelInfo.provider === "lime");
+
+      if (isLimeChannel) {
+        try {
+          console.log(`[Lime] Retry с обновлением ссылки для ${path}...`);
+          await refreshLimeLinks();
+          const freshUrl = LIME_DYNAMIC[path];
+          if (freshUrl && freshUrl !== channelInfo?.url) {
+            const retryRes = await fetchWithRetry(freshUrl, { headers: getHeaders(freshUrl) }, 3, 20000);
+            if (retryRes.ok) {
+              const rawM3u8 = await retryRes.text();
+              const processedM3u8 = resolveM3u8Urls(rawM3u8, freshUrl, devKey);
+              m3u8Cache.set(cachedKey, { content: processedM3u8, expiresAt: Date.now() + 3000 });
+              response.writeHead(200, { ...corsHeaders(), "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8" });
+              response.end(processedM3u8);
+              console.log(`[Lime] ✅ Retry успешен для ${path}`);
+              return;
+            }
+            console.error(`[Lime] Retry для ${path}: HTTP ${retryRes.status}`);
+          }
+        } catch (e2) {
+          console.error(`[Lime] Retry для ${path} не удался: ${e2.message}`);
+        }
+      }
+
       if (cached && cached.content) {
-        response.writeHead(200, {
-          ...corsHeaders(),
-          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-        });
+        response.writeHead(200, { ...corsHeaders(), "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8" });
         response.end(cached.content);
         return;
       }
@@ -724,7 +694,7 @@ server.listen(PORT, "0.0.0.0", () => {
   fetchConfig().catch(() => {});
   fetchAllowedDevices().catch(() => {});
 
-  // Запускаем обновление Lime-ссылок сразу и каждые 20 минут
+  // Токен Lime живёт 24 часа, обновляем каждые 10 минут — с большим запасом
   refreshLimeLinks().catch(console.error);
-  setInterval(() => refreshLimeLinks().catch(console.error), 20 * 60 * 1000);
+  setInterval(() => refreshLimeLinks().catch(console.error), 10 * 60 * 1000);
 });
