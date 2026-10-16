@@ -22,7 +22,7 @@ const LHD_AGENT = JSON.stringify({
   version_name: "1.0.2.203",
   version_code: "203",
   platform: "win",
-  device_id: "00000000",
+  device_id: "448182.66555409547-1790167864304",
   app: "tv.limehd.win",
   generation: "2",
 });
