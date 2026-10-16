@@ -1,0 +1,37 @@
+name: Keep GitVerse Alive (Both Repos)
+
+on:
+  schedule:
+    - cron: "0 0 */3 * *" # Запуск каждые 3 дня
+  workflow_dispatch: # Кнопка для ручного запуска на GitHub
+
+jobs:
+  ping-gitverse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Скачиваем код
+        uses: actions/checkout@v4
+
+      - name: Настройка бота
+        run: |
+          git config --global user.name "keeper-bot"
+          git config --global user.email "bot@keeper.com"
+
+      - name: 1. Будим репозиторий Витрины (mediavitrina-proxy)
+        run: |
+          git remote add gitverse-v https://oauth2:${{ secrets.GITVERSETOKEN }}@gitverse.ru/Timofey91/mediavitrina-proxy.git
+          git fetch gitverse-v master || true
+          git checkout master || git checkout -b master
+          git commit --allow-empty -m "Keep-alive ping mediavitrina"
+          git push gitverse-v master
+          git remote remove gitverse-v
+
+      - name: 2. Будим репозиторий Лайма (peer_test)
+        run: |
+          git checkout -- .
+          git remote add gitverse-p https://oauth2:${{ secrets.GITVERSETOKEN }}@gitverse.ru/Timofey91/peer_test.git
+          git fetch gitverse-p master || true
+          git checkout master || git checkout -b master
+          git commit --allow-empty -m "Keep-alive ping peer_test"
+          git push gitverse-p master
+          git remote remove gitverse-p
