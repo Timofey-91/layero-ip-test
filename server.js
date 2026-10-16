@@ -2,7 +2,7 @@ import http from "node:http";
 import { URL } from "node:url";
 import { Readable } from "node:stream";
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8000;
 const DEVICES_CONFIG_URL = process.env.DEVICES_CONFIG_URL;
 
 // ======================================================
