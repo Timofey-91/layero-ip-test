@@ -21,9 +21,9 @@ const WINK_CONFIG_URL =
 const LHD_AGENT = JSON.stringify({
   version_name: "1.0.2.203",
   version_code: "203",
-  platform: "win",
-  device_id: "00000000",
-  app: "tv.limehd.win",
+  platform: "web",
+  device_id: "974946.4052656315-1792222055659",
+  app: "russia-tv.online.web",
   generation: "2",
 });
 
