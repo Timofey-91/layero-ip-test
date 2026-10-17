@@ -22,8 +22,8 @@ const LHD_AGENT = JSON.stringify({
   version_name: "1.0.2.203",
   version_code: "203",
   platform: "web",
-  device_id: "974946.4052656315-1792222055659",
-  app: "russia-tv.online.web",
+  device_id: "00000000",
+  app: "tv.limehd.win",
   generation: "2",
 });
 
