@@ -3,36 +3,30 @@ import { URL } from "node:url";
 import { Readable } from "node:stream";
 
 const PORT = process.env.PORT || 3000;
+
+// URL секретного файла Gist читается из переменных окружения Layero
 const DEVICES_CONFIG_URL = process.env.DEVICES_CONFIG_URL;
 
-// ======================================================
-// CONFIG URLS
-// ======================================================
+// Множество разрешенных ключей устройств
+let ALLOWED_DEVICES = new Set();
+
+// Конфиг LimeHD
 const LIME_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/peer_test/raw/branch/master/config.json";
 
+// Конфиг Wink
 const WINK_CONFIG_URL =
   "https://gitverse.ru/api/repos/Timofey91/mediavitrina-proxy/raw/branch/master/wink.json";
 
-const VITRINA_CONFIG_URL =
-  "https://gitverse.ru/api/repos/Timofey91/mediavitrina-proxy/raw/branch/master/config.json";
-
-// ======================================================
-// HEADERS & AGENTS
-// ======================================================
 const LHD_AGENT = JSON.stringify({
   version_name: "1.0.2.203",
   version_code: "203",
-  platform: "win",
+  platform: "web",
   device_id: "00000000",
   app: "tv.limehd.win",
   generation: "2",
 });
 
-const VITRINA_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 8.0.1;)";
-const VITRINA_REFERER = "https://player.mediavitrina.ru/";
-
-let ALLOWED_DEVICES = new Set();
 let configCache = { data: null, expiresAt: 0 };
 const m3u8Cache = new Map();
 
@@ -52,6 +46,7 @@ function isWinkUrl(targetUrl) {
   return (
     u.includes("wink") ||
     u.includes("rt.ru") ||
+    u.includes("mediavitrina") ||
     u.includes("ngenix") ||
     u.includes("cdntv") ||
     u.includes("zabava")
@@ -89,17 +84,6 @@ function getHeaders(targetUrl) {
   };
 }
 
-function getVitrinaHeaders() {
-  return {
-    "User-Agent": VITRINA_USER_AGENT,
-    "Referer": VITRINA_REFERER,
-    "Accept": "*/*",
-  };
-}
-
-// ======================================================
-// FETCH WITH RETRY
-// ======================================================
 async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) {
   let lastError;
   for (let i = 0; i < retries; i++) {
@@ -125,11 +109,12 @@ async function fetchWithRetry(url, options = {}, retries = 2, timeoutMs = 2500) 
   throw lastError || new Error(`Failed to fetch ${url}`);
 }
 
-// ======================================================
-// DEVICE KEYS (Фоновая загрузка без блокировок)
-// ======================================================
+// Подгрузка списка разрешенных ключей устройств из Secret Gist
 async function fetchAllowedDevices() {
-  if (!DEVICES_CONFIG_URL) return;
+  if (!DEVICES_CONFIG_URL) {
+    console.warn("[Devices] Переменная DEVICES_CONFIG_URL не задана в Layero, проверка ключей отключена.");
+    return;
+  }
 
   try {
     const res = await fetchWithRetry(
@@ -143,16 +128,14 @@ async function fetchAllowedDevices() {
       const devicesArray = await res.json();
       if (Array.isArray(devicesArray)) {
         ALLOWED_DEVICES = new Set(devicesArray.map((d) => String(d).trim()));
+        console.log(`[Devices] Загружено разрешенных ключей: ${ALLOWED_DEVICES.size}`);
       }
     }
   } catch (e) {
-    console.error("[Devices] Ошибка загрузки ключей из Gist:", e.message);
+    console.error("[Devices] Ошибка загрузки списка устройств из Gist:", e.message);
   }
 }
 
-// ======================================================
-// CONFIG LOADER (Lime + Wink + Vitrina)
-// ======================================================
 async function fetchConfig(forceRefresh = false) {
   const now = Date.now();
 
@@ -161,7 +144,7 @@ async function fetchConfig(forceRefresh = false) {
   }
 
   const refreshInBackground = async () => {
-    const [limeRes, winkRes, vitrinaRes] = await Promise.allSettled([
+    const [limeRes, winkRes] = await Promise.allSettled([
       fetchWithRetry(
         LIME_CONFIG_URL,
         {
@@ -185,55 +168,32 @@ async function fetchConfig(forceRefresh = false) {
         2,
         3000
       ),
-      fetchWithRetry(
-        VITRINA_CONFIG_URL,
-        {
-          headers: {
-            "Cache-Control": "no-cache, no-store",
-            "User-Agent": VITRINA_USER_AGENT,
-          },
-        },
-        2,
-        3000
-      ),
     ]);
 
     let limeData = {};
     let winkData = {};
-    let vitrinaData = {};
 
     if (limeRes.status === "fulfilled" && limeRes.value.ok) {
-      try { limeData = await limeRes.value.json(); } catch (e) {}
+      try {
+        limeData = await limeRes.value.json();
+      } catch (e) {}
     }
+
     if (winkRes.status === "fulfilled" && winkRes.value.ok) {
-      try { winkData = await winkRes.value.json(); } catch (e) {}
-    }
-    if (vitrinaRes.status === "fulfilled" && vitrinaRes.value.ok) {
-      try { vitrinaData = await vitrinaRes.value.json(); } catch (e) {}
-    }
-
-    const combinedMap = {};
-
-    // 1. Lime
-    for (const [ch, url] of Object.entries(limeData)) {
-      combinedMap[ch] = { url, provider: "lime" };
-    }
-    // 2. Wink
-    for (const [ch, url] of Object.entries(winkData)) {
-      combinedMap[ch] = { url, provider: "wink" };
-    }
-    // 3. MediaVitrina (Приоритет)
-    for (const [ch, url] of Object.entries(vitrinaData)) {
-      combinedMap[ch] = { url, provider: "vitrina" };
+      try {
+        winkData = await winkRes.value.json();
+      } catch (e) {}
     }
 
-    if (Object.keys(combinedMap).length > 0) {
+    const combinedData = { ...winkData, ...limeData };
+
+    if (Object.keys(combinedData).length > 0) {
       configCache = {
-        data: { ...(configCache.data || {}), ...combinedMap },
-        expiresAt: Date.now() + 2 * 60 * 1000,
+        data: { ...(configCache.data || {}), ...combinedData },
+        expiresAt: Date.now() + 60 * 1000,
       };
     }
-    return configCache.data || combinedMap;
+    return configCache.data || combinedData;
   };
 
   if (configCache.data && Object.keys(configCache.data).length > 0) {
@@ -244,14 +204,15 @@ async function fetchConfig(forceRefresh = false) {
   return await refreshInBackground();
 }
 
-// Автоматические интервалы обновления данных
-setInterval(() => fetchConfig(true).catch(() => {}), 4 * 60 * 1000);
-setInterval(() => fetchAllowedDevices().catch(() => {}), 5 * 60 * 1000);
-
-// Защита от накопительного роста памяти: сброс микрокэша m3u8 раз в час
+// Обновление конфигов каналов раз в 4 минуты
 setInterval(() => {
-  m3u8Cache.clear();
-}, 60 * 60 * 1000);
+  fetchConfig(true).catch(() => {});
+}, 4 * 60 * 1000);
+
+// Авто-обновление ключей устройств из Secret Gist каждые 5 минут
+setInterval(() => {
+  fetchAllowedDevices().catch(() => {});
+}, 5 * 60 * 1000);
 
 function isM3u8Url(urlStr) {
   try {
@@ -266,11 +227,7 @@ function isM3u8Url(urlStr) {
   }
 }
 
-// ======================================================
-// REWRITERS
-// ======================================================
-
-// Lime и Wink (Перенаправление сегментов на /proxy-segment)
+// Приписывает параметр &dev=key к переписанным ссылкам на сегменты и плейлисты
 function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   const baseUrl = new URL(baseUrlStr);
   const lines = m3u8Text.split("\n");
@@ -308,51 +265,26 @@ function resolveM3u8Urls(m3u8Text, baseUrlStr, devKey = "") {
   return resolvedLines.join("\n");
 }
 
-// MediaVitrina (БЕСПРОКСИРУЮЩИЙ РЕЖИМ — прямые ссылки на CDN Витрины)
-function rewriteVitrinaPlaylist(m3u8Text, targetUrl) {
-  let baseUrl;
-  try {
-    baseUrl = new URL(targetUrl);
-  } catch {
-    return m3u8Text;
+// Генерация M3U плейлиста со всеми доступными каналами
+function generatePlaylist(config, host, devKey = "") {
+  const lines = ["#EXTM3U"];
+  const devParam = devKey ? `?dev=${encodeURIComponent(devKey)}` : "";
+
+  for (const channelId of Object.keys(config)) {
+    lines.push(`#EXTINF:-1 tvg-id="${channelId}" tvg-name="${channelId}",${channelId}`);
+    lines.push(`http://${host}/${channelId}.m3u8${devParam}`);
   }
 
-  return m3u8Text
-    .split(/\r?\n/)
-    .map((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return line;
-
-      if (trimmed.startsWith("#") && trimmed.includes('URI="')) {
-        return line.replace(/URI="([^"]+)"/g, (match, uri) => {
-          try {
-            return `URI="${new URL(uri, baseUrl).toString()}"`;
-          } catch {
-            return match;
-          }
-        });
-      }
-
-      if (!trimmed.startsWith("#")) {
-        try {
-          return new URL(trimmed, baseUrl).toString();
-        } catch {
-          return line;
-        }
-      }
-
-      return line;
-    })
-    .join("\n");
+  return lines.join("\n");
 }
 
-// ======================================================
-// SERVER
-// ======================================================
 const server = http.createServer(async (request, response) => {
   try {
     const hostHeader = request.headers.host || "localhost";
-    const url = new URL(request.url, `http://${hostHeader}`);
+    const url = new URL(
+      request.url,
+      `http://${hostHeader}`
+    );
 
     // 1. CORS Preflight
     if (request.method === "OPTIONS") {
@@ -361,7 +293,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 2. Robots.txt
+    // 2. Отбивка поисковых ботов
     if (url.pathname === "/robots.txt") {
       response.writeHead(200, {
         ...corsHeaders(),
@@ -371,17 +303,17 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 3. Health Check (Корень / открыт для зеленого статуса в Layero)
+    // 3. Корень / - Пинг для Health Check от Layero (без проверки ключей)
     if (url.pathname === "/" || url.pathname === "") {
       response.writeHead(200, {
         ...corsHeaders(),
         "Content-Type": "text/plain; charset=utf-8",
       });
-      response.end("All-in-One TV Proxy (Lime + Wink + Vitrina) is running.");
+      response.end("Lime & Wink TV Proxy is running.");
       return;
     }
 
-    // 4. Проверка ключа устройства
+    // 4. Проверка ключа устройства (выполняется, только если переменная Gist задана)
     const devKey = url.searchParams.get("dev");
     if (DEVICES_CONFIG_URL && ALLOWED_DEVICES.size > 0) {
       if (!devKey || !ALLOWED_DEVICES.has(devKey)) {
@@ -391,7 +323,24 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    // 5. Проксирование вложенных M3U8 (Lime/Wink)
+    // 5. Выгрузка M3U плейлиста для IPTV-плееров (/playlist.m3u, /playlist.m3u8, /m3u)
+    if (
+      url.pathname === "/playlist.m3u" ||
+      url.pathname === "/playlist.m3u8" ||
+      url.pathname === "/m3u"
+    ) {
+      const config = await fetchConfig();
+      const playlistContent = generatePlaylist(config, hostHeader, devKey);
+
+      response.writeHead(200, {
+        ...corsHeaders(),
+        "Content-Type": "application/x-mpegurl; charset=utf-8",
+      });
+      response.end(playlistContent);
+      return;
+    }
+
+    // 6. Проксирование вложенных M3U8
     if (url.pathname === "/proxy-m3u8") {
       const targetUrl = url.searchParams.get("url");
 
@@ -428,7 +377,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 6. Проксирование видеосегментов (Lime/Wink)
+    // 7. Проксирование сегментов
     if (url.pathname === "/proxy-segment") {
       const targetUrl = url.searchParams.get("url");
 
@@ -470,7 +419,9 @@ const server = http.createServer(async (request, response) => {
       };
 
       const contentLength = segmentRes.headers.get("content-length");
-      if (contentLength) resHeaders["Content-Length"] = contentLength;
+      if (contentLength) {
+        resHeaders["Content-Length"] = contentLength;
+      }
 
       if (isWink && segmentRes.headers.get("content-range")) {
         resHeaders["Content-Range"] = segmentRes.headers.get("content-range");
@@ -489,7 +440,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    // 7. Обработка прямых запросов каналов (например /tvc, /tvc.m3u8, /1tv, /ctc)
+    // 8. Запрос M3U8 плейлиста конкретного канала
     const path = url.pathname.replace(/^\/+/, "").replace(/\.m3u8$/i, "");
 
     const now = Date.now();
@@ -507,9 +458,9 @@ const server = http.createServer(async (request, response) => {
 
     try {
       const config = await fetchConfig();
-      const channelInfo = config[path];
+      const streamUrl = config[path];
 
-      if (!channelInfo || !channelInfo.url) {
+      if (!streamUrl) {
         if (cached && cached.content) {
           response.writeHead(200, {
             ...corsHeaders(),
@@ -524,36 +475,16 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      let processedM3u8 = "";
+      const streamResponse = await fetchWithRetry(streamUrl, {
+        headers: getHeaders(streamUrl),
+      });
 
-      if (channelInfo.provider === "vitrina") {
-        // Запрос к Витрине (беспроксирующий режим)
-        const streamResponse = await fetchWithRetry(
-          channelInfo.url,
-          { headers: getVitrinaHeaders() },
-          2,
-          4000
-        );
-
-        if (!streamResponse.ok) {
-          throw new Error(`Vitrina status ${streamResponse.status}`);
-        }
-
-        const rawM3u8 = await streamResponse.text();
-        processedM3u8 = rewriteVitrinaPlaylist(rawM3u8, channelInfo.url);
-      } else {
-        // Запрос к Lime / Wink (режим подмены заголовков)
-        const streamResponse = await fetchWithRetry(channelInfo.url, {
-          headers: getHeaders(channelInfo.url),
-        });
-
-        if (!streamResponse.ok) {
-          throw new Error(`CDN status ${streamResponse.status}`);
-        }
-
-        const rawM3u8 = await streamResponse.text();
-        processedM3u8 = resolveM3u8Urls(rawM3u8, channelInfo.url, devKey);
+      if (!streamResponse.ok) {
+        throw new Error(`CDN status ${streamResponse.status}`);
       }
+
+      const rawM3u8 = await streamResponse.text();
+      const processedM3u8 = resolveM3u8Urls(rawM3u8, streamUrl, devKey);
 
       m3u8Cache.set(cachedKey, {
         content: processedM3u8,
@@ -588,7 +519,7 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`All-in-One Proxy listening on port ${PORT}`);
+  console.log(`Lime & Wink Proxy listening on port ${PORT}`);
   fetchConfig().catch(() => {});
   fetchAllowedDevices().catch(() => {});
 });
